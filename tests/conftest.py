@@ -15,6 +15,41 @@ def write_jl(path: Path, rows):
 	path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
 
 
+class FakeBrowser:
+	"""What the scout tools read from a browser: the current page's url, title and text."""
+
+	def __init__(self, text: str = '', url: str = 'https://example.org/', title: str = 'Page'):
+		self.page, self.at, self.name, self.url_ = text, url, title, 'fake'
+
+	async def url(self):
+		return self.at
+
+	async def title(self):
+		return self.name
+
+	async def text(self):
+		return self.page
+
+
+def tool_runner(tools):
+	"""run(name, **args) -> NS(error, extracted_content), the way the agent sees a tool's result."""
+	import asyncio
+	from types import SimpleNamespace as NS
+
+	from rl_env_use.agent import ToolError
+
+	by = {t.name: t for t in tools}
+
+	def run(name, **kw):
+		t = by[name]
+		try:
+			return NS(error=None, extracted_content=asyncio.run(t.fn(**dict(t.params(**kw)))))
+		except ToolError as e:
+			return NS(error=str(e), extracted_content=None)
+
+	return run
+
+
 def mk_task(i, answer='137', answer_type='number', category='lookup', **kw):
 	t = {
 		'id': f't{i}',
@@ -107,15 +142,17 @@ def env_dir(tmp_path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def no_network(monkeypatch):
-	"""No test may reach a paid API: every key is blank (main()'s .env loading never overrides a set variable) and there is
-	no local claude CLI. A test that needs a route sets its own key and fakes the client."""
+def no_network(request, monkeypatch):
+	"""No test may reach a paid service: no API key (main()'s .env loading never overrides a set variable), no local claude
+	or codex CLI, no Modal. A test that needs a route fakes it and the client. Only `-m live` tests reach the real ones."""
+	if request.node.get_closest_marker('live'):
+		return
+	import rl_env_use.cloud as cloud
 	import rl_env_use.llm as L
 
-	for k in L.KEYS.values():
-		if k:
-			monkeypatch.setenv(k, '')
+	monkeypatch.setenv('ANTHROPIC_API_KEY', '')
 	monkeypatch.setattr(L.shutil, 'which', lambda b: None)
+	monkeypatch.setattr(cloud, 'configured', lambda: False)
 	import rl_env_use.pipeline as P
 
 	async def offline(url, *a, **k):  # look() fetches every mined page: never from a test

@@ -16,7 +16,7 @@ import re
 from pydantic import BaseModel, Field
 
 from . import ui
-from .browse import browser, capture, page_text, quote_in
+from .browse import browser, capture, quote_in
 from .checks import grade_answer
 from .graders import norm, numbers, prob_of
 from .llm import call, now
@@ -74,8 +74,7 @@ async def closed_book(tasks: list[dict], models: list[str]) -> None:
 
 async def check_live(tasks: list[dict], facts: dict, headless: bool = True) -> None:
 	"""Re-open every cited source page in a real browser and confirm each quote is still there."""
-	session = browser(headless=headless)
-	await session.start()
+	session = await browser().start()
 	cache = {}
 	try:
 		for t in tasks:
@@ -88,19 +87,18 @@ async def check_live(tasks: list[dict], facts: dict, headless: bool = True) -> N
 				for _attempt in range(2) if f['url'] not in cache else ():
 					cache[f['url']] = None
 					try:
-						await session.navigate_to(f['url'])
+						await session.goto(f['url'])
 						for _ in range(5):  # dynamic pages (GitHub, HF, arXiv HTML) render late: poll before calling it stale
 							await asyncio.sleep(2)
-							cache[f['url']] = await page_text(session)
+							cache[f['url']] = await session.text()
 							if quote_in(f['quote'], cache[f['url']]):
 								break
 						else:  # lazy sections (long database records): expand and scroll once more before calling it stale
 							cache[f['url']] = (await capture(session, f['url']))['text']
 						break
-					except Exception:  # a dead cloud browser would fail every later page: start a fresh one and retry
+					except Exception:  # a dead browser would fail every later page: start a fresh one and retry
 						await session.kill()
-						session = browser(headless=headless)
-						await session.start()
+						session = await browser().start()
 				text = cache[f['url']]
 				ok = None if text is None else ok and quote_in(f['quote'], text)  # None = page never loaded: retried, not stale
 				if ok is None:
@@ -158,10 +156,10 @@ class Adjudication(BaseModel):
 	panel_error: str = Field(description="The concrete mistake behind the models' answer - or why they are right and the gold is wrong.")
 
 
-PANEL = ['opus55', 'gpt-astra', 'gemini']  # frontier models of three labs: a task is dropped only when all of them solve it
+PANEL = ['opus55', 'gpt-astra']  # frontier models of two labs (your Claude and ChatGPT accounts): a task is dropped only when both solve it
 
 
-ADJUDICATORS = ['gpt-astra', 'opus55', 'gemini']  # the first one that did not give the disputed answer
+ADJUDICATORS = ['gpt-astra', 'opus55']  # the first one that did not give the disputed answer
 
 
 SHIFT = 0.1  # forecasts: the materials must move the panel's probability by this much (outcome-blind: surprises stay in)

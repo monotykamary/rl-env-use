@@ -242,9 +242,9 @@ def visited_urls(trace: list[dict]) -> list[str]:
 	return [m.group(1) for t in trace if t['role'] == 'assistant' for m in [re.match(r'\[step \d+ @ (\S+)\]', t['content'])] if m]
 
 
-# Actions whose result is page content the agent read. Never `done`/`input`/`write_file`: those echo the policy's
-# own text, and counting them would let it ground itself.
-READ_ACTIONS = {'extract', 'find_text', 'search_page', 'find_elements', 'dropdown_options', 'scroll'}
+# Actions whose result is page content the agent read (agent.py's tools; the rest are earlier traces' browser-use
+# actions). Never `done`/`navigate`/`type_text`: those echo the policy's own text, and counting them would let it ground itself.
+READ_ACTIONS = {'read_page', 'snapshot', 'list_links', 'extract', 'find_text', 'search_page', 'find_elements', 'dropdown_options', 'scroll'}
 
 
 def _observations(trace: list[dict]) -> list[tuple[str, str]]:

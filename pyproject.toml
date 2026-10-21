@@ -1,10 +1,10 @@
 [project]
 name = "rl-env-use"
 version = "0.1.0"
-description = "Build RL environments for any domain from real cases that Browser Use agents mine from the web"
+description = "Build RL environments for any domain from real cases that browser agents (browser-harness-js on Modal) mine from the web"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
-dependencies = ["browser-use==0.13.10", "httpx", "pydantic>=2", "rich"]
+dependencies = ["modal>=1.6", "httpx", "pydantic>=2", "rich"]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
@@ -24,7 +24,7 @@ rl_env_use = ["annotate.html", "report/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-markers = ["live: hits the network / paid LLM APIs (run with -m live)"]
+markers = ["live: hits the network, Modal or the model CLIs (run with -m live)"]
 addopts = "-m 'not live'"
 
 [tool.ruff]

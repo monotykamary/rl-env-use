@@ -8,19 +8,16 @@ A case = materials (what the model under test is given) + facts with the same ca
 import asyncio
 import json
 import re
-import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
-from browser_use import Agent, Tools
-from browser_use.agent.views import ActionResult
-from browser_use.browser import BrowserSession
 from pydantic import BaseModel, Field
 
 from . import ui
-from .browse import SEARCH_ENGINES, UNUSED, browser, http_capture, page_text, quote_in
+from .agent import Tool, ToolError, run_agent, tool
+from .browse import SEARCH_ENGINES, Browser, browser, http_capture, quote_in
 from .graders import norm
-from .llm import LEDGER, call, make_llm, now, usage_dict
+from .llm import LEDGER, call, now
 from .store import write_atomic
 
 ANGLES = {
@@ -67,7 +64,7 @@ def fact_issue(value: str, quote: str) -> str | None:
 
 
 MATERIAL_CHARS = (300, 20000)
-MISSION_TIMEOUT = 1500  # a cloud browser stuck reconnecting held a mission for 80 minutes; what it saved stays saved
+MISSION_TIMEOUT = 1500  # a browser stuck reconnecting once held a mission for 80 minutes; what it saved stays saved
 MAX_MATERIALS = 3  # per case before its outcome is recorded: input is cheap, the outcome is the hard part
 
 
@@ -99,98 +96,97 @@ def slice_passage(text: str, starts_with: str, ends_with: str) -> str:
 	return passage
 
 
-def make_tools(kb: dict, angle: str, save=lambda: None, tally: dict | None = None) -> Tools:
+def make_tools(kb: dict, angle: str, b: Browser, save=lambda: None, tally: dict | None = None) -> list[Tool]:
 	tally = {} if tally is None else tally  # what this mission saved: the source-health record
 	own = set()  # case keys this mission opened
-	tools = Tools(exclude_actions=[x for x in UNUSED if x not in ('search_page', 'find_elements')])  # zero-LLM grep/CSS queries over big tables
 
-	@tools.action(
+	@tool(
 		'Record one verifiable fact you can see on the CURRENT page. `quote` must be copied verbatim from the page and contain the value. `case`: the case key when this fact is the outcome of a case, else empty.'
 	)
-	async def record_fact(claim: str, quote: str, browser_session: BrowserSession, value: str = '', case: str = '') -> ActionResult:
+	async def record_fact(claim: str, quote: str, value: str = '', case: str = '') -> str:
 		keys = {m['case'] for m in kb.get('materials', [])}
 		if case and keys and case not in keys:  # an outcome must land on the case its material was saved under
-			return ActionResult(error=f'Unknown case key {case!r}. Use the exact key you saved its material under: {sorted(keys)[-12:]}')
+			raise ToolError(f'Unknown case key {case!r}. Use the exact key you saved its material under: {sorted(keys)[-12:]}')
 		if not value.strip():  # agent models often drop this field: a quote holding exactly one number names it
 			nums = re.findall(r'[-+]?\$?\d[\d,]*(?:\.\d+)?%?', quote)
 			if len(nums) != 1:
-				return ActionResult(error='Give `value`: the short atomic value (number, date, name) inside the quote that the claim is about.')
+				raise ToolError('Give `value`: the short atomic value (number, date, name) inside the quote that the claim is about.')
 			value = nums[0]
 		if issue := fact_issue(value, quote):
-			return ActionResult(error=issue)
-		url, text = await browser_session.get_current_page_url(), await page_text(browser_session)
+			raise ToolError(issue)
+		url, text = await b.url(), await b.text()
 		if SEARCH_ENGINES.match(url):
-			return ActionResult(error='Search result snippets are not evidence. Open the primary source page and record the fact there.')
+			raise ToolError('Search result snippets are not evidence. Open the primary source page and record the fact there.')
 		if not quote_in(quote, text):
-			return ActionResult(error='Quote not found verbatim on the current page. Copy the exact text that contains the value.' + near(text, value))
+			raise ToolError('Quote not found verbatim on the current page. Copy the exact text that contains the value.' + near(text, value))
 		if any(f['url'] == url and norm(f['value']) == norm(value) and f.get('case') == (case or None) for f in kb['facts']):  # another case may share the value
-			return ActionResult(extracted_content=f'Already recorded: {value}')
+			return f'Already recorded: {value}'
 		kb['facts'].append(
 			{'id': f'f{len(kb["facts"])}', 'claim': claim, 'value': value, 'quote': quote, 'url': url, 'angle': angle, 'at': now(), **({'case': case} if case else {})}
 		)
 		tally['outcomes' if case else 'facts'] = tally.get('outcomes' if case else 'facts', 0) + 1
 		save()
-		return ActionResult(extracted_content=f'Recorded fact: {claim} = {value}', long_term_memory=f'Recorded fact #{len(kb["facts"])}: {claim}')
+		return f'Recorded fact #{len(kb["facts"])}: {claim} = {value}'
 
-	@tools.action(
+	@tool(
 		'Save the OUTCOME of a case as a verbatim passage of the CURRENT page - a results section, a results table, a decision - when it is a table or several numbers (record_fact is for one value). Give the first and last few words exactly as on the page; everything between is saved. `case`: the key its material was saved under. Save what the page shows; never a computed or summarized value.'
 	)
-	async def record_outcome(case: str, title: str, starts_with: str, ends_with: str, browser_session: BrowserSession) -> ActionResult:
+	async def record_outcome(case: str, title: str, starts_with: str, ends_with: str) -> str:
 		keys = {m['case'] for m in kb.get('materials', [])}
 		if case not in keys:
-			return ActionResult(error=f"Unknown case key {case!r}: save the case's material first, or use the exact key it was saved under: {sorted(keys)[-12:]}")
-		url, text = await browser_session.get_current_page_url(), await page_text(browser_session)
+			raise ToolError(f"Unknown case key {case!r}: save the case's material first, or use the exact key it was saved under: {sorted(keys)[-12:]}")
+		url, text = await b.url(), await b.text()
 		if SEARCH_ENGINES.match(url):
-			return ActionResult(error='Search result snippets are not evidence. Open the primary source page.')
+			raise ToolError('Search result snippets are not evidence. Open the primary source page.')
 		passage = slice_passage(text, starts_with, ends_with)
 		if passage.startswith('!'):
-			return ActionResult(error=passage[1:])
+			raise ToolError(passage[1:])
 		if any(f.get('case') == case and passage in f['quote'] for f in kb['facts']):
-			return ActionResult(extracted_content=f'Already saved for case {case}.')
+			return f'Already saved for case {case}.'
 		kb['facts'].append(
 			{'id': f'f{len(kb["facts"])}', 'claim': title, 'value': '(results passage)', 'quote': passage, 'url': url, 'angle': angle, 'at': now(), 'case': case, 'passage': True}
 		)
 		tally['outcomes'] = tally.get('outcomes', 0) + 1
 		save()
-		return ActionResult(extracted_content=f'Saved outcome for case {case}: {title} ({len(passage)} chars)', long_term_memory=f'Outcome for case {case}: {title}')
+		return f'Saved outcome for case {case}: {title} ({len(passage)} chars)'
 
-	@tools.action(
+	@tool(
 		'Save a passage of the CURRENT page as input material for a case (what the model under test will read). Give the first and last few words of the passage exactly as on the page; everything between them is saved verbatim. `case`: a short key naming the entity, reused for its outcome fact.'
 	)
-	async def record_material(case: str, title: str, starts_with: str, ends_with: str, browser_session: BrowserSession) -> ActionResult:
-		url, text = await browser_session.get_current_page_url(), await page_text(browser_session)
+	async def record_material(case: str, title: str, starts_with: str, ends_with: str) -> str:
+		url, text = await b.url(), await b.text()
 		passage = slice_passage(text, starts_with, ends_with)
 		if passage.startswith('!'):
-			return ActionResult(error=passage[1:])
+			raise ToolError(passage[1:])
 		mine = [m for m in kb.get('materials', []) if m['case'] == case]
 		if mine and angle not in ('outcome', 'enrich') and case not in own:  # parallel missions pick keys independently
-			return ActionResult(error=f'Case key {case!r} is already taken by another case. Use a distinct key that includes the record id (e.g. the registry or filing number).')
+			raise ToolError(f'Case key {case!r} is already taken by another case. Use a distinct key that includes the record id (e.g. the registry or filing number).')
 		own.add(case)
 		if len(mine) >= MAX_MATERIALS and not any(f.get('case') == case for f in kb['facts']):  # complete cases may be enriched
-			return ActionResult(
-				error=f'Case {case} already has {len(mine)} materials and no outcome: record its outcome with record_fact or record_outcome (case="{case}") now (cut larger passages instead of many small ones).'
+			raise ToolError(
+				f'Case {case} already has {len(mine)} materials and no outcome: record its outcome with record_fact or record_outcome (case="{case}") now (cut larger passages instead of many small ones).'
 			)
 		if any(passage in m['text'] for m in mine):
-			return ActionResult(extracted_content=f'Already saved for case {case}: this passage is part of a saved material. Move on to its outcome.')
+			return f'Already saved for case {case}: this passage is part of a saved material. Move on to its outcome.'
 		kb.setdefault('materials', []).append({'id': f'm{len(kb["materials"])}', 'case': case, 'title': title, 'text': passage, 'url': url, 'at': now()})
 		tally['materials'] = tally.get('materials', 0) + 1
 		save()
-		return ActionResult(extracted_content=f'Saved material for case {case}: {title} ({len(passage)} chars)', long_term_memory=f'Material for case {case}: {title}')
+		return f'Saved material for case {case}: {title} ({len(passage)} chars)'
 
-	@tools.action('Record a realistic question a user might ask on this topic, why it is hard for a browser agent, and the page where its answer lives (if known).')
-	async def record_task_idea(question: str, why_hard: str, answer_url: str = '', browser_session: BrowserSession = None) -> ActionResult:
-		kb['ideas'].append({'question': question, 'why_hard': why_hard, 'answer_url': answer_url or await browser_session.get_current_page_url(), 'angle': angle})
+	@tool('Record a realistic question a user might ask on this topic, why it is hard for a browser agent, and the page where its answer lives (if known).')
+	async def record_task_idea(question: str, why_hard: str, answer_url: str = '') -> str:
+		kb['ideas'].append({'question': question, 'why_hard': why_hard, 'answer_url': answer_url or await b.url(), 'angle': angle})
 		save()
-		return ActionResult(extracted_content=f'Recorded task idea: {question}', long_term_memory=f'Recorded idea: {question}')
+		return f'Recorded task idea: {question}'
 
-	@tools.action('Record a useful source website for this topic (the CURRENT page) with a short note on what it contains and how to navigate it.')
-	async def record_source(note: str, browser_session: BrowserSession) -> ActionResult:
-		url, title = await browser_session.get_current_page_url(), await browser_session.get_current_page_title()
+	@tool('Record a useful source website for this topic (the CURRENT page) with a short note on what it contains and how to navigate it.')
+	async def record_source(note: str) -> str:
+		url, title = await b.url(), await b.title()
 		kb['sources'].append({'url': url, 'title': title, 'note': note, 'angle': angle})
 		save()
-		return ActionResult(extracted_content=f'Recorded source {url}', long_term_memory=f'Recorded source {url}')
+		return f'Recorded source {url}'
 
-	return tools
+	return [record_fact, record_outcome, record_material, record_task_idea, record_source]
 
 
 def source_health(kb: dict) -> str:
@@ -299,9 +295,8 @@ def case_task(topic: str, skill: str, m: Mission) -> str:
 	)
 
 
-async def run_mission(m: Mission, topic: str, kb: dict, model: str, max_steps: int, headless: bool, save=lambda: None, skill: str | None = None) -> dict:
+async def run_mission(m: Mission, topic: str, kb: dict, model: str, max_steps: int, headless: bool = True, save=lambda: None, skill: str | None = None) -> dict:
 	tally = {}
-	tools = make_tools(kb, m.angle, save, tally)
 	task = (
 		case_task(topic, skill, m)
 		if skill
@@ -313,40 +308,29 @@ async def run_mission(m: Mission, topic: str, kb: dict, model: str, max_steps: i
 			'When done, report your observations about what makes this domain hard for a browser agent.'
 		)
 	)
-	agent = Agent(
-		task=task,
-		llm=make_llm(model),
-		tools=tools,
-		browser_session=browser(headless=headless),
-		output_model_schema=ScoutSummary,
-		use_judge=False,
-		enable_signal_handler=False,
-		calculate_cost=True,
-	)  # its handler exits on SIGTERM without closing cloud browsers; ours cancels and cleans up
-	try:
-		h = await agent.run(max_steps=max_steps)
+	b = browser()
+	try:  # a cancelled or crashed mission still stops its browser (a Modal sandbox bills until it stops); what it saved stays saved
+		await b.start()
+		h = await run_agent(
+			model,
+			task,
+			b,
+			ScoutSummary,
+			make_tools(kb, m.angle, b, save, tally),
+			max_steps,
+			done_description='Finish the mission: report your observations about where the data lives and what made it hard to reach. Call exactly once, as the last action.',
+			timeout=MISSION_TIMEOUT - 60,
+		)
 	finally:
-		try:  # a cancelled or crashed mission must still release its cloud browser (billed until it times out)
-			await asyncio.wait_for(agent.close(), 30)
-		except (Exception, asyncio.CancelledError):
-			pass
-		shutil.rmtree(agent.agent_directory, ignore_errors=True)  # browser-use's per-agent temp dir (screenshots)
-		try:  # a mission that crashed or timed out was still billed for its steps
-			LEDGER.add(agent.llm.model, usage_dict(await agent.token_cost_service.get_usage_summary()))
-		except Exception:
-			pass
-	try:
-		out = h.structured_output
-	except ValueError:  # agent finished with free text instead of the schema
-		out = ScoutSummary(observations=[h.final_result() or ''])
+		await b.kill()
 	return {
 		'angle': m.angle,
 		'start_url': m.start_url,
 		'instructions': m.instructions,
-		'steps': h.number_of_steps(),
-		'done': h.is_done(),
-		'observations': out.observations if out else [],
-		'urls': list(dict.fromkeys(u for u in h.urls() if u)),
+		'steps': h.steps,
+		'done': h.done,
+		'observations': h.output.observations if h.output else [],
+		'urls': h.urls,
 		'recorded': tally,
 	}
 
@@ -355,7 +339,7 @@ async def scout(
 	topic: str,
 	out_dir: Path,
 	n_missions: int = 4,
-	model: str = 'bu',
+	model: str = 'sonnet46',
 	max_steps: int = 30,
 	headless: bool = True,
 	concurrency: int = 4,
@@ -393,9 +377,11 @@ async def scout(
 				try:
 					kb['missions'].append(await asyncio.wait_for(run_mission(m, topic, kb, model, max_steps, headless, save, skill), MISSION_TIMEOUT))
 					break
-				except (Exception, asyncio.CancelledError) as e:  # browser-use timeouts surface as CancelledError; one mission must not sink the rest
-					if attempt < 2 and re.search(r'Failed to create cloud browser|HTTP 503|Too many concurrent|HTTP 429', str(e)):
-						await asyncio.sleep(60)  # the browser never started: wait for the pool, then retry
+				except (Exception, asyncio.CancelledError) as e:  # one mission must not sink the rest
+					if isinstance(e, asyncio.CancelledError) and asyncio.current_task().cancelling():
+						raise  # a real outer cancellation (Ctrl-C) must propagate
+					if attempt < 2 and re.search(r'CloudError|sandbox|rate limit|usage limit|overloaded|HTTP 429|HTTP 503', f'{type(e).__name__}: {e}', re.I):
+						await asyncio.sleep(60)  # the browser or the model never started: wait, then retry
 						continue
 					kb['missions'].append({'angle': m.angle, 'start_url': m.start_url, 'instructions': m.instructions, 'error': f'{type(e).__name__}: {e}'})
 					break

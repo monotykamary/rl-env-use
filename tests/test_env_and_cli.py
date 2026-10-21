@@ -35,8 +35,6 @@ def test_cli_split_audit_export(env_dir, capsys):
 	main(['export', str(env_dir)])
 	rows = jl(env_dir / 'dataset.jsonl')
 	assert len(rows) == 20 and 'checks' not in rows[0] and rows[0]['answer'] == '137'
-	y = (env_dir / 'agent_tasks' / 't3.yaml').read_text().splitlines()
-	assert y[0] == 'name: "t3"' and y[2] == 'judge_context:' and '137' in y[3] and y[-1] == 'max_steps: 25'
 
 
 def test_split_requires_state(env_dir):
@@ -77,9 +75,11 @@ def test_regrade_restores_rows_of_readmitted_tasks(env_dir):
 
 def test_new_topic_spec_with_sources(tmp_path, monkeypatch):
 	monkeypatch.chdir(tmp_path)
-	main(['new', 'Rare Variants', '--topic', 'rare variants', '--sources', 'https://gnomad.broadinstitute.org/', 'https://www.uniprot.org/', '--proxy-country', 'de'])
+	main(
+		['new', 'Rare Variants', '--topic', 'rare variants', '--sources', 'https://gnomad.broadinstitute.org/', 'https://www.uniprot.org/', '--proxy', 'http://proxy.example:3128']
+	)
 	s = json.loads((tmp_path / 'envs/rare-variants/spec.json').read_text())
-	assert s['sources'][1] == 'https://www.uniprot.org/' and s['proxy_country'] == 'de' and s['missions'] == 4
+	assert s['sources'][1] == 'https://www.uniprot.org/' and s['proxy'] == 'http://proxy.example:3128' and s['missions'] == 4
 	with pytest.raises(SystemExit):
 		main(['new', 'Rare Variants', '--topic', 'again'])
 	with pytest.raises(SystemExit):
@@ -92,24 +92,24 @@ def test_rejecting_a_fact_drops_tasks_that_cite_it(env_dir):
 	assert 't3' not in ids and 't4' in ids
 
 
-def test_run_applies_profile_and_proxy(monkeypatch, tmp_path):
+def test_run_applies_the_env_proxy(monkeypatch):
 	import os
 
+	from rl_env_use.browse import Browser
 	from rl_env_use.pipeline import use_browser_spec
 
-	monkeypatch.setenv('RLENV_PROXY_COUNTRY', 'us')  # restored after the test
-	use_browser_spec({'proxy_country': 'de'})
-	assert os.environ['RLENV_PROXY_COUNTRY'] == 'de'
+	monkeypatch.setenv('RLENV_PROXY', 'http://old:1')  # restored after the test
+	use_browser_spec({'proxy': 'http://proxy.example:3128'})
+	assert os.environ['RLENV_PROXY'] == 'http://proxy.example:3128' and Browser().proxy == 'http://proxy.example:3128'
 
 
 def test_run_dry_run_estimates_without_spending(env_dir, capsys, monkeypatch):
 	monkeypatch.chdir(env_dir.parent)
-	monkeypatch.setenv('BROWSER_USE_API_KEY', 'x')
 	main(['run', str(env_dir), '--model', 'haiku', '--dry-run'])
-	main(['run', str(env_dir), '--model', 'bu', '--dry-run'])
+	main(['run', str(env_dir), '--model', 'qwen-35b', '--dry-run'])
 	out = capsys.readouterr().out
 	assert '20 episodes on haiku: ~$0.03, ~1 min at concurrency 4 (measured on 20 earlier episodes)' in out
-	assert '20 episodes on bu: not measured on this env yet' in out and not (env_dir / 'hillclimb' / 'baseline' / 'errors.jsonl').exists()
+	assert '20 episodes on qwen-35b: not measured on this env yet' in out and not (env_dir / 'hillclimb' / 'baseline' / 'errors.jsonl').exists()
 
 
 def test_every_flow_is_regraded_and_audited(env_dir):

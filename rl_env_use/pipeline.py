@@ -21,7 +21,7 @@ from . import ui
 from .browse import host, http_capture, quote_in
 from .env import Env
 from .graders import grade_answer
-from .llm import LEDGER, book_bu, bu_balance, call
+from .llm import LEDGER, call
 from .rollout import rollout, trace_grade
 from .scout import scout
 from .store import load_jsonl, save_jsonl, write_atomic
@@ -81,10 +81,9 @@ def kb_for_synth(env: Path) -> dict:
 
 
 def use_browser_spec(spec: dict) -> None:
-	"""Logged-in cloud profile / proxy country for every browser this env opens (miners, checks and policies alike)."""
-	for k, var in (('profile_id', 'RLENV_CLOUD_PROFILE_ID'), ('proxy_country', 'RLENV_PROXY_COUNTRY')):
-		if spec.get(k):
-			os.environ[var] = spec[k]
+	"""The env's proxy (Chromium --proxy-server) for every browser it opens: miners, checks and policies alike."""
+	if spec.get('proxy'):
+		os.environ['RLENV_PROXY'] = spec['proxy']
 
 
 def unverified(t: dict) -> bool:
@@ -103,7 +102,7 @@ async def build(env: Path, spec: dict, only: str | None = None, model: str = 'so
 			spec['topic'],
 			env,
 			spec.get('missions', 4),
-			spec.get('agent_model', 'bu'),
+			spec.get('agent_model', 'sonnet46'),
 			spec.get('max_steps', 40),
 			True,
 			spec.get('concurrency', 4),
@@ -161,7 +160,7 @@ async def verify_stage(env: Path, spec: dict, model: str) -> str:
 	await closed_book(todo, spec.get('closed_book', ['haiku', 'sonnet46']))
 	if spec.get('live_check', True):
 		await check_live(todo, facts)
-	else:  # miners verified every quote on the live page when recording it; the re-check (a cloud browser) is for staleness
+	else:  # miners verified every quote on the live page when recording it; the re-check (a Modal browser) is for staleness
 		for t in todo:
 			t['checks']['live'] = 'skipped'
 	await critique(todo, facts, model)
@@ -301,13 +300,10 @@ async def create(env: Path, spec: dict, model: str = 'sonnet46', log=print) -> d
 	use_browser_spec(spec)
 	target, dry, prior = spec.get('target_tasks', 150), 0, spec.get('spent_usd', 0.0)  # a resumed env keeps its earlier spend
 	budget = spec.get('budget_usd', 40.0) - prior
-	per_mission = 0.35  # $ per mining mission, measured on earlier envs
+	per_mission = 0.35  # $ per mining mission (agent tokens + its browser), measured on earlier envs
 	missions = spec.get('missions', 12)
 
-	bu0 = bu_balance()
-
 	def save_spend():  # after every stage: a crash or kill must not forget what was spent
-		book_bu(bu0)
 		spec['spent_usd'] = round(prior + LEDGER.usd, 4)
 		write_atomic(env / 'spec.json', json.dumps(spec, indent=1))
 
@@ -323,7 +319,17 @@ async def create(env: Path, spec: dict, model: str = 'sonnet46', log=print) -> d
 		before = len(balanced([t for t in load_jsonl(env / 'tasks.jsonl') if keep(t)]))
 		topic = spec['topic'] + (f'\nCASE SELECTION (never by outcome): {spec["sampling"]}' if spec.get('sampling') else '')
 		kb = await scout(
-			topic, env, missions, spec.get('agent_model', 'bu'), spec.get('max_steps', 60), True, spec.get('concurrency', 6), model, None, spec.get('sources'), spec.get('skill')
+			topic,
+			env,
+			missions,
+			spec.get('agent_model', 'sonnet46'),
+			spec.get('max_steps', 60),
+			True,
+			spec.get('concurrency', 6),
+			model,
+			None,
+			spec.get('sources'),
+			spec.get('skill'),
 		)
 		log(f'round {rnd}: scout {missions} missions -> {len(cases(kb))} complete cases (${prior + LEDGER.usd:.2f} spent in total)')
 		ui.stage('look', 1)
@@ -394,7 +400,4 @@ def regrade_row(vdir: Path, task: dict, row: dict) -> dict:
 
 
 def export(env: Path, out: Path) -> int:
-	e = Env(env)
-	if any(not t.get('context') for t in e.tasks()):
-		e.export_browser_use_yaml(env / 'agent_tasks')
-	return e.export_jsonl(out)
+	return Env(env).export_jsonl(out)

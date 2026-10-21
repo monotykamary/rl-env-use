@@ -1,4 +1,5 @@
-"""rl-env-use: an RL environment for a skill in any domain, built from real cases that Browser Use agents mine where they live.
+"""rl-env-use: an RL environment for a skill in any domain, built from real cases that browser agents mine where they live
+(headless Chromium on Modal, driven through browser-harness-js; models through your Claude and ChatGPT CLIs or Modal GPUs).
 
 autonomous:
   create  "<topic, skill, sources - one line>"   plan the spec, mine, write, verify and calibrate tasks until the env is ready
@@ -11,6 +12,7 @@ step by step:
   run     <env> --model M       the model solves the tasks (reads each case, no browser); graded, audited, hillclimb/report.html
   report  <env>                 regrade stored runs (+ calibrated judges), audit, report.html
   compare <env>                 A/B against vanilla Claude Code browsing (WebSearch + WebFetch): mining and solving
+  stop                          stop every Modal container of rl-env-use still running (each command stops its own)
 
 advanced: codify (failure taxonomy from your notes), judges (narrow judges calibrated on your labels),
           split (train/test for /claude-api hillclimb), export (JSONL dataset)
@@ -35,8 +37,11 @@ CASE_METRICS = [('correct', 'Correct')]
 
 
 def run(coro):
-	"""asyncio.run() without its shutdown phase: browser-use leaves tasks that ignore cancellation (see main). Ctrl-C or a
-	kill cancels the work and waits up to 45 s, so every agent's finally block releases its cloud browser."""
+	"""asyncio.run() without its shutdown phase (a CLI agent's pipes can outlive their task). Ctrl-C or a kill cancels the
+	work and waits up to 45 s, so every agent's finally block stops its browser; then every Modal container still alive
+	(model servers, anything missed) is stopped before the command returns."""
+	from . import cloud
+
 	loop = asyncio.new_event_loop()
 	main = loop.create_task(coro)
 	try:
@@ -45,6 +50,8 @@ def run(coro):
 		main.cancel()
 		loop.run_until_complete(asyncio.wait([main], timeout=45))
 		raise
+	finally:
+		loop.run_until_complete(cloud.shutdown())
 
 
 def spec_of(env: Path) -> dict:
@@ -80,9 +87,9 @@ def cmd_new(a):
 	if (env / 'spec.json').exists():
 		raise SystemExit(f'{env}/spec.json exists - edit it instead')
 	env.mkdir(parents=True, exist_ok=True)
-	spec = {'topic': a.topic, 'sources': a.sources, 'missions': max(4, 2 * len(a.sources)), 'agent_model': 'bu', 'max_steps': 40, 'concurrency': 4}
+	spec = {'topic': a.topic, 'sources': a.sources, 'missions': max(4, 2 * len(a.sources)), 'agent_model': 'sonnet46', 'max_steps': 40, 'concurrency': 4}
 	spec |= {'skill': a.skill, 'tasks_per_case': 2, 'panel': PANEL} if a.skill else {'n_tasks': 30, 'hard': False}
-	spec |= ({'profile_id': a.profile} if a.profile else {}) | ({'proxy_country': a.proxy_country} if a.proxy_country else {})
+	spec |= {'proxy': a.proxy} if a.proxy else {}
 	(env / 'spec.json').write_text(json.dumps(spec, indent=1))
 	print(f'{env}/spec.json written. Next: rl-env-use build {env}')
 
@@ -104,7 +111,7 @@ def cmd_create(a):
 			'request': a.line,
 			'auto': True,
 			'missions': a.missions,
-			'agent_model': 'bu',
+			'agent_model': 'sonnet46',
 			'max_steps': 60,
 			'concurrency': 6,
 			'tasks_per_case': 4,
@@ -190,15 +197,17 @@ def cmd_review(a):
 
 def cmd_run(a):
 	env = Path(a.env)
-	a.model = a.model or ('sonnet46' if spec_of(env).get('skill') else 'bu')
+	a.model = a.model or 'sonnet46'
 	if a.dry_run:  # the consent gate before a paid run: $ and minutes per episode measured on this env's earlier runs of the model
 		from .audit import load_variants
-		from .llm import MODELS, resolve
+		from .llm import MODELS, model_ids, resolve
 		from .pipeline import load_kept
 
 		n = len([t for t in load_kept(env, a.verified) if t.get('context') or not a.blind][: a.limit or None]) * a.reps  # the tasks the real run would take
-		mids = {m for _, m in MODELS.get(a.model, [])} or {resolve(a.model)[1]}  # the same model measured on any route; pricing needs no key
-		past = [r for f in flows(env) for rows in load_variants(f).values() for r in rows if r.get('status') == 'ok' and any(m in r.get('model', '') for m in mids)]
+		modal = any(r == 'modal' for r, _ in MODELS.get(a.model, [])) or a.model.startswith('modal:')
+		# the same model measured on any route, earlier token-billed runs included - except for a Modal model, whose cost is GPU time
+		mids = ({m for _, m in MODELS.get(a.model, [])} if modal else model_ids(a.model) - {a.model}) or {resolve(a.model)[1]}
+		past = [r for f in flows(env) for rows in load_variants(f).values() for r in rows if r.get('status') == 'ok' and r.get('model') in mids | {f'modal:{m}' for m in mids}]
 		if not past:
 			return print(f'{n} episodes on {a.model}: not measured on this env yet - run a pilot first (--limit 5) and dry-run again')
 		usd, sec = sum(r['cost_usd'] for r in past) / len(past), sum(r['latency_s'] for r in past) / len(past)
@@ -230,9 +239,9 @@ def cmd_run(a):
 
 def model_slot(flow: Path, model: str) -> str:
 	"""The slot of `model` in a comparison flow: the one whose change.md names it, else the next free one."""
-	from .llm import MODELS
+	from .llm import model_ids
 
-	ids = {m for _, m in MODELS.get(model, [])} | {model}
+	ids = model_ids(model)
 	named = lambda d: (d / 'change.md').read_text().strip() == model if (d / 'change.md').exists() else any(r.get('model') in ids for r in load_jsonl(d / 'results.jsonl')[:1])  # noqa: E731
 	slot = next((d.name for d in sorted(flow.glob('*')) if d.is_dir() and named(d)), None) if flow.exists() else None
 	if slot is None:
@@ -255,7 +264,7 @@ def cmd_compare(a):
 		for m in [m for m in ms if m.get('angle') != 'outcome' and 'error' not in m]:  # spread over sources: the n first missions per start host, round-robin
 			by_src.setdefault(m['start_url'].split('/')[2], []).append({k: m[k] for k in ('angle', 'instructions', 'start_url')})
 		pick = [x for i in range(a.missions) for v in by_src.values() if i < len(v) for x in [v[i]]][: a.missions]
-		for arm, r in run(compare_mining(env, spec, pick, a.cc_model, a.bu_model)).items():
+		for arm, r in run(compare_mining(env, spec, pick, a.cc_model, a.agent_model)).items():
 			print(
 				f'{arm:12s} '
 				+ (f'{r["complete_cases"]} cases -> {r["tasks_kept"]}/{r["tasks_drafted"]} tasks kept, ' if 'complete_cases' in r else '')
@@ -264,6 +273,13 @@ def cmd_compare(a):
 	if a.variant:
 		print(f'-> {run(solve(load_kept(env), env / "hillclimb", a.variant, a.cc_model, a.timeout, a.concurrency))}/results.jsonl')
 		report(env, judges=False)
+
+
+def cmd_stop(a):
+	from .cloud import stop_all
+
+	ids = stop_all()
+	print(f'stopped {len(ids)} rl-env-use Modal app(s) and their containers' + (f': {" ".join(ids)}' if ids else ' - none was running'))
 
 
 def cmd_report(a):
@@ -459,15 +475,15 @@ def main(argv=None):
 	)
 	q.add_argument('--name', help='env name (default: planned); an existing env of that name is resumed')
 	q.add_argument('--tasks', type=int, help='target number of kept tasks (default 150; a resume keeps its own)')
-	q.add_argument('--budget', type=float, help='$ cap for mining, writing, verifying and calibrating, Browser Use + OpenRouter (default 40; a resume keeps its own)')
+	q.add_argument('--budget', type=float, help='$ cap for mining, writing, verifying and calibrating: API-equivalent model cost + Modal time (default 40; a resume keeps its own)')
 	q.add_argument('--missions', type=int, default=12, help='mining missions in the first round (later rounds are sized from the measured yield)')
 	q.add_argument('--model', default='sonnet46', help='planner, task writer and critic')
-	q.add_argument('--panel', nargs='+', help='difficulty panel (default: the frontier, opus55 gpt-astra gemini); a task is dropped only if every panel model solves it')
+	q.add_argument('--panel', nargs='+', help='difficulty panel (default: the frontier, opus55 gpt-astra); a task is dropped only if every panel model solves it')
 	q.add_argument('--mix', choices=['derive', 'predict', 'mixed'], help='override the planned task kinds')
 	q.add_argument('--plan-only', action='store_true', help='print the planned spec and stop')
 	q = sp.add_parser('climb', help="autonomous: hillclimb a policy's system prompt on an env")
 	q.add_argument('env')
-	q.add_argument('--model', required=True, help='the policy to climb (e.g. qwen-27b, haiku, bu-mini, gemini-flash)')
+	q.add_argument('--model', required=True, help='the policy to climb (e.g. qwen-35b, qwen-27b, haiku, or modal:<hf-org>/<model>)')
 	q.add_argument('--rounds', type=int, default=8)
 	q.add_argument('--k', type=int, default=3, help='candidate edits per round (screened on train, the best goes to test)')
 	q.add_argument('--reps', type=int, default=3)
@@ -489,8 +505,7 @@ def main(argv=None):
 		help='what the model must do, input -> outcome, e.g. "given a 10-Q, predict whether the next 10-K carries a going-concern warning". Omit for browse tasks (the model finds answers on the live web)',
 	)
 	q.add_argument('--sources', nargs='+', default=[], help='where the data lives: portals, databases, search pages, forums')
-	q.add_argument('--profile', help='Browser Use cloud profile id with your logins, for sources behind a login')
-	q.add_argument('--proxy-country', help='proxy country code for geo-restricted sources, e.g. de')
+	q.add_argument('--proxy', help='proxy for every browser of this env (Chromium --proxy-server, e.g. http://host:3128), for geo-restricted sources')
 	q = sp.add_parser('build', help='mine the sources, then write and verify tasks')
 	q.add_argument('env')
 	q.add_argument('--only', help='(re)run one stage: scout (another mining round, appended), look, synth (more tasks, appended), verify, panel, harden')
@@ -502,7 +517,7 @@ def main(argv=None):
 	q.add_argument('--port', type=int, default=8765)
 	q = sp.add_parser('run', help='run the policy under test, grade, audit, report')
 	q.add_argument('env')
-	q.add_argument('--model', help='policy model: opus55, gpt-astra, gemini, sonnet46, haiku, qwen-27b, bu, ... (default sonnet46 for case tasks, bu for browse tasks)')
+	q.add_argument('--model', help='policy model: opus55, gpt-astra, sonnet46, haiku, qwen-35b, qwen-27b, modal:<hf-org>/<model>, ... (default sonnet46)')
 	q.add_argument('--variant', help='baseline or v<N> (default: baseline; in a comparison --flow, the slot of --model)')
 	q.add_argument('--reps', type=int, default=1)
 	q.add_argument('--timeout', type=float, default=600)
@@ -519,9 +534,10 @@ def main(argv=None):
 	q.add_argument('--missions', type=int, default=0, help="mining A/B: rerun N of the env's missions with both harnesses")
 	q.add_argument('--variant', help="solving A/B: run Claude Code on the env's tasks as this hillclimb variant (v<N>)")
 	q.add_argument('--cc-model', default='claude-sonnet-4-6', help='model for the Claude Code arm')
-	q.add_argument('--bu-model', default='sonnet46', help='same model on the Browser Use gateway for the mining arm (sonnet5 does not drive browser-use 0.13.10 agents yet)')
+	q.add_argument('--agent-model', default='sonnet46', help='the same model as a browser agent (browser-harness-js on Modal) for the mining arm')
 	q.add_argument('--timeout', type=float, default=900)
 	q.add_argument('--concurrency', type=int, default=4)
+	sp.add_parser('stop', help='stop every Modal container of rl-env-use still running in your workspace')
 	q = sp.add_parser('report', help='regrade, audit, write report.html')
 	q.add_argument('env')
 	q.add_argument('--no-judges', action='store_true', help='skip applying calibrated judges to new runs')
@@ -549,14 +565,14 @@ def main(argv=None):
 	for sig in (signal.SIGINT, signal.SIGTERM):  # a kill cleans up like Ctrl-C (a job started with & ignores SIGINT otherwise)
 		signal.signal(sig, signal.default_int_handler)
 	load_dotenv()
-	if a.cmd in ('create', 'climb') and sys.stdout.isatty():  # the live board replaces the agents' step-by-step log
-		os.environ.setdefault('BROWSER_USE_LOGGING_LEVEL', 'result')
 	try:
 		globals()[f'cmd_{a.cmd}'](a)
 	finally:
 		if LEDGER.by_model:
 			print(f'spend: ${LEDGER.usd:.3f}  {json.dumps(LEDGER.by_model)}')
-		if a.cmd in ('build', 'run', 'compare', 'create', 'climb') and not getattr(a, 'dry_run', False):  # browser-use leaves non-daemon threads (event bus, cloud sessions) alive
+		if a.cmd in ('build', 'run', 'compare', 'create', 'climb') and not getattr(
+			a, 'dry_run', False
+		):  # the Modal client and CLI pipes leave non-daemon threads alive (containers are already stopped)
 			if sys.exc_info()[0]:  # os._exit skips the interpreter's traceback printing
 				import traceback
 

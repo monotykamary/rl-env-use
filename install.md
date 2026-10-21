@@ -1,6 +1,6 @@
 ---
 name: rl-env-use-install
-description: Install rl-env-use into the current agent (Claude Code, Codex, Hermes, Openclaw, etc.) and set up the Browser Use and OpenRouter API keys so the user can build an environment right away.
+description: Install rl-env-use into the current agent (Claude Code, Codex, Hermes, Openclaw, etc.) and check that Modal and the claude / codex CLIs are signed in, so the user can build an environment right away. No API keys are needed.
 ---
 
 # rl-env-use install
@@ -10,34 +10,37 @@ Use this file only for first-time install or reconnect. For daily use, read `SKI
 ## What you're doing
 
 You're setting up a tool that turns one line ("predict whether a clinical trial met its primary endpoint from its
-registered protocol") into an RL environment built from real cases that Browser Use agents mine from the web, and then
+registered protocol") into an RL environment built from real cases that browser agents mine from the web, and then
 hillclimbs a model on it. After install the user says what skill they want an environment for; you run it by reading
 `SKILL.md`.
 
-Four things must exist on this machine:
+Five things must exist on this machine:
 
 1. The `rl-env-use` repo cloned somewhere stable, installed into its own virtual environment (Python 3.11+).
-2. A Browser Use API key (cloud browsers for the mining agents) and an OpenRouter API key (every LLM call: planner,
-   task writer, critic, frontier panel, the models under test) in `.env` at the repo root.
-3. Optionally Node.js (>= 18) on `$PATH`: it writes the HTML reports. Without it everything works and the reports are
-   skipped.
-4. The current agent can discover `SKILL.md` (a skills directory, or an import in its `CLAUDE.md`-equivalent).
+2. A Modal token. Every browser (headless Chromium driven through browser-harness-js) and every open-weight model
+   (vLLM on a GPU) runs in a Modal sandbox. Each sandbox stops when its job ends.
+3. At least one signed-in model CLI: Claude Code (`claude`) for the Claude models, which are the default for the
+   planner, task writer, critic, miners and policies. Codex (`codex`) for the GPT models, which sit on the default
+   difficulty panel next to Opus.
+4. Optionally Node.js (>= 18) on `$PATH`, which writes the HTML reports. Without it everything works and the reports
+   are skipped.
+5. The current agent can discover `SKILL.md` (a skills directory, or an import in its `CLAUDE.md`-equivalent).
 
 ## Install prompt contract
 
-- Do everything yourself. Only ask the user for the two API keys.
+- Do everything yourself. Ask the user only to sign in where something is not signed in (Modal, claude, codex).
 - Prefer a stable clone path like `~/Developer/rl-env-use` (not `/tmp`, not `~/Downloads`).
-- Never spend credits during install. Every check below is free.
+- Never spend credits during install. Every check below is free, and none starts a Modal container.
 
 ## Steps
 
 ### 1. Clone and install
 
 ```bash
-test -d ~/Developer/rl-env-use || git clone https://github.com/browser-use/rl-env-use ~/Developer/rl-env-use
+test -d ~/Developer/rl-env-use || git clone https://github.com/monotykamary/rl-env-use ~/Developer/rl-env-use
 cd ~/Developer/rl-env-use
 command -v uv >/dev/null && uv venv && uv pip install -e '.[test]' || (python3 -m venv .venv && .venv/bin/pip install -e '.[test]')
-.venv/bin/python -m pytest -q   # offline, no keys needed, ~10 s
+.venv/bin/python -m pytest -q   # offline, no accounts needed, ~10 s
 ```
 
 If the repo is already there, `git pull --ff-only` and re-run the install line.
@@ -52,39 +55,41 @@ If the repo is already there, `git pull --ff-only` and re-run the install line.
 Put the CLI on the user's path so it runs from any folder: `ln -sfn ~/Developer/rl-env-use/.venv/bin/rl-env-use ~/.local/bin/rl-env-use`
 (any directory on `$PATH` works).
 
-### 3. API keys
+### 3. Accounts
 
-Check what is already there and stop at the first hit for each key: an exported `BROWSER_USE_API_KEY` /
-`OPENROUTER_API_KEY`, or a non-empty line in `~/Developer/rl-env-use/.env`. For each missing key, ask the user once:
-
-> I need a Browser Use API key for the mining agents' cloud browsers - get one at https://cloud.browser-use.com - and an
-> OpenRouter API key for the language models - https://openrouter.ai/keys. Paste them here and I'll write them to
-> `~/Developer/rl-env-use/.env`.
+Check each one and stop at the first hit:
 
 ```bash
-cp -n .env.example .env && chmod 600 .env   # then fill in the two values; never echo them back, never commit .env
+.venv/bin/modal profile current                                   # a profile name = Modal is set up
+command -v claude && echo 'Reply with: ok' | claude -p --model haiku --tools '' --setting-sources ''   # ok = Claude is signed in
+command -v codex && codex login status                            # "Logged in" = Codex is signed in
 ```
 
-Free checks:
+- **No Modal token**: ask the user to run `! ~/Developer/rl-env-use/.venv/bin/modal token new` (it opens a browser to sign in).
+- **No `claude`**: Claude Code is required for the default models. Ask the user to install and sign in
+  (https://claude.com/claude-code), or, if they prefer the API, to put `ANTHROPIC_API_KEY=...` in
+  `~/Developer/rl-env-use/.env` (`cp -n .env.example .env && chmod 600 .env`; never echo the key back, never commit `.env`).
+- **No `codex`**: optional. Without it, the GPT models are unavailable; pass `--panel opus55 sonnet55` to `create`.
 
-```bash
-.venv/bin/python -c "from rl_env_use.llm import load_dotenv, bu_balance; load_dotenv(); print('Browser Use credits:', bu_balance())"
-curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer ${OPENROUTER_API_KEY:-$(sed -n 's/^OPENROUTER_API_KEY=//p' .env)}" https://openrouter.ai/api/v1/key
-```
-
-`None` or `401` means a wrong key: ask once more.
+Nothing else is needed: there is no OpenRouter or Browser Use key.
 
 ### 4. Verify end-to-end (free)
 
 ```bash
-.venv/bin/rl-env-use run envs/trial-forecast --model qwen-35b --flow models --dry-run   # prices a run from the shipped env's measurements; writes nothing
+.venv/bin/rl-env-use run envs/trial-forecast --model opus55 --flow models --dry-run   # prices a run from the shipped env's measurements; writes nothing
 ```
 
 ### 5. Hand off
 
-Tell the user, in one short message: where it is installed, that a good first message is *"build me an RL environment
-for <skill> from <where the data lives>"*, that a build costs real credits (the shipped envs cost $20-75 each; `create`
-stops at its `--budget`, $40 by default), and that everything lands in `./envs/<name>/`.
+Tell the user, in one short message:
+
+- where it is installed;
+- that a good first message is *"build me an RL environment for <skill> from <where the data lives>"*;
+- that a build costs real usage: Claude and Codex calls count against their accounts, and browsers and open-weight
+  models run on Modal. The budget counts the API-equivalent price plus Modal time; the shipped envs cost $20-75 each,
+  and `create` stops at its `--budget`, $40 by default;
+- that every Modal container stops by itself when its job ends, and `rl-env-use stop` sweeps any left over;
+- that everything lands in `./envs/<name>/`.
 
 ## Keeping it current
 

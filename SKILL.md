@@ -1,6 +1,6 @@
 ---
 name: rl-env-use
-description: Build an RL environment / eval that trains or measures a skill in any domain (finance, medicine, law, math, science, a niche industry) from real cases that Browser Use agents mine from the web, then baseline and hillclimb a model on it. Use when the user knows a domain and what a model should be able to do in it, but not how to get the data or build the environment.
+description: Build an RL environment / eval that trains or measures a skill in any domain (finance, medicine, law, math, science, a niche industry) from real cases that browser agents (browser-harness-js on Modal) mine from the web, then baseline and hillclimb a model on it. Use when the user knows a domain and what a model should be able to do in it, but not how to get the data or build the environment.
 ---
 
 # rl-env-use
@@ -9,6 +9,11 @@ Anthropic's [build-eval -> hillclimb](https://claude.dev/blog/automating-eval-de
 real inputs. If the claude-api skill is available, its `shared/evals/build-eval.md` and `shared/evals/eval-hillclimb.md`
 are the method. A case = the materials the model gets + its true outcome, published elsewhere or later. Browser agents
 mine both. The model under test reads the materials and answers without a browser.
+
+No API keys: Claude models run through `claude -p`, GPT models through `codex exec`, browsers and open-weight models
+(qwen-35b, qwen-27b, `modal:<hf-org>/<model>`) on Modal. Every Modal container stops when its job ends, when the
+command ends, or when Modal sees it idle; `rl-env-use stop` sweeps any left over. Never leave a command of this tool
+running in the background without telling the user: it holds Modal containers while it runs.
 
 Commands: `rl-env-use ...` (or `python -m rl_env_use ...`). Every env is one folder, `./envs/<name>/`.
 
@@ -35,13 +40,13 @@ logs are git-ignored.
    (skill, sources, conventions, an outcome-blind sampling rule). Mining rounds then run until the task target, the
    budget, or two rounds with no new tasks. Each round: mine -> write -> verify -> panel -> harden -> verify -> panel.
    - Derived numbers are computed by code from an expression over numbers in the materials.
-   - The frontier panel (opus55, gpt-astra, gemini) measures difficulty. All-pass tasks go back to the drafter and
+   - The frontier panel (opus55, gpt-astra) measures difficulty. All-pass tasks go back to the drafter and
      come back harder on the same case, up to two levels. Forecasts must move with the materials and must not be
      answerable without them. At most 60% of served forecasts resolve one way.
    - When the panel saturates derive tasks (on SEC filings it solves nearly every computation), later rounds write
      forecasts. Derive tasks stay useful for smaller policies: pass `--panel` with the policy family.
    - Mining is fastest when the line names a URL that lists records (a registry API query, a search page).
-   - Ctrl-C stops cleanly (cloud browsers are released); `create --name <env>` resumes with its spend so far.
+   - Ctrl-C stops cleanly (every Modal container is stopped); `create --name <env>` resumes with its spend so far.
 2. `climb envs/<name> --model M`: the hillclimb loop in `climb-<model>/`. Split by case, A/A noise from rep halves,
    refuses saturated or underpowered setups, K edits per round screened on train, kept only on a paired case-bootstrap
    test gain, failure audit on stalls, final baseline-vs-best on fresh reps. Report the final line and
@@ -56,8 +61,8 @@ Ask every decision with AskUserQuestion, your pick first as "(Recommended)". Wai
 
 **Step 0: what is evaluated.** Ask: (1) the skill as input -> outcome ("given a trial's protocol, predict whether it met
 its primary endpoint"), one per env; (2) where inputs and outcomes live (2-6 URLs), ideally separated in place or time;
-(3) logins (Browser Use profile id) or a proxy country. Then
-`new <name> --topic "<domain>" --skill "<input -> outcome>" --sources URL.. [--profile ID] [--proxy-country CC]`.
+(3) a proxy for geo-restricted sources, if any. Then
+`new <name> --topic "<domain>" --skill "<input -> outcome>" --sources URL.. [--proxy http://host:port]`.
 Without `--skill` it is a browse-task env (the model must find answers on the live web).
 
 **Step 1: mine the cases (sign-off 1).** `build envs/<name>` mines (~$0.15-0.40 per mission) and stops before any task

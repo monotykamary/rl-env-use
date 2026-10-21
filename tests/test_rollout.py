@@ -1,28 +1,10 @@
 import asyncio
 import json
-from types import SimpleNamespace as NS
 
 import pytest
 from conftest import jl, mk_task
 
 import rl_env_use.rollout as R
-
-
-def fake_history(tmp_path):
-	shot = tmp_path / 's.png'
-	shot.write_bytes(b'png')
-	action = NS(model_dump=lambda exclude_none: {'navigate': {'url': 'https://arxiv.org/abs/1'}})
-	mo = NS(evaluation_previous_goal='ok', memory='m', next_goal='open paper', thinking='think', action=[action])
-	step = NS(model_output=mo, result=[NS(error=None, extracted_content='opened', is_done=False)], state=NS(screenshot_path=str(shot), url='https://arxiv.org'))
-	done = NS(model_output=None, result=[NS(error=None, extracted_content=None, is_done=True)], state=NS(screenshot_path=None, url='https://arxiv.org/abs/1'))
-	return NS(history=[step, done])
-
-
-def test_history_to_trace(tmp_path):
-	tr = R.history_to_trace(fake_history(tmp_path), 'TASK')
-	assert [t['role'] for t in tr] == ['system', 'assistant', 'tool_call', 'tool_result', 'tool_result']
-	assert not any('attachments' in t for t in tr) and not list(tmp_path.rglob('step*.png'))
-	assert tr[1]['thinking'] == 'think' and tr[2]['name'] == 'navigate' and tr[-1]['content'] == 'done'
 
 
 def test_public_hides_gold():

@@ -14,6 +14,15 @@ pytestmark = pytest.mark.live
 load_dotenv()
 
 
+@pytest.fixture(autouse=True)
+def stop_modal():
+	"""Whatever a test leaves running on Modal (a model server, a browser a failure skipped) is stopped right after it."""
+	from rl_env_use import cloud
+
+	yield
+	asyncio.run(cloud.shutdown())
+
+
 def gt_env():
 	tasks, facts = jl(GT / 'web_tasks.jsonl'), {}
 	for t in tasks:
@@ -64,7 +73,7 @@ def test_policy_smoke(tmp_path):
 	from rl_env_use.rollout import rollout
 
 	tasks = [t for t in jl(GT / 'web_tasks.jsonl') if t['id'] in ('gt_mind2web_sites', 'gt_browsecomp_q', 'gt_webarena_v1')]
-	v = asyncio.run(rollout(tasks, tmp_path, model='bu', max_steps=12, concurrency=3))
+	v = asyncio.run(rollout(tasks, tmp_path, model='sonnet46', max_steps=12, concurrency=3))
 	rows = jl(v / 'results.jsonl')
 	assert len(rows) == 3 and all(r['usage']['input_tokens'] > 0 and r['latency_s'] > 0 for r in rows)
 	assert sum(r['grade']['correct'] for r in rows) >= 2, [r['meta'] for r in rows]

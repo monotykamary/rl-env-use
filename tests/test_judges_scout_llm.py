@@ -1,8 +1,7 @@
 import asyncio
-from types import SimpleNamespace as NS
 
 import pytest
-from conftest import mk_task
+from conftest import FakeBrowser, mk_task, tool_runner
 
 import rl_env_use.llm as L
 import rl_env_use.scout as S
@@ -70,17 +69,9 @@ def test_quote_in():
 
 def test_record_fact_rejects_hallucinated_quotes(monkeypatch):
 	kb = {'facts': [], 'ideas': [], 'sources': []}
-	tools = S.make_tools(kb, 'longtail')
-
-	async def page_text(_):
-		return 'Mind2Web: tasks collected from 137 websites spanning 31 domains.'
-
-	async def url():
-		return 'https://arxiv.org/abs/2306.06070'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
-	sess = NS(get_current_page_url=url, cdp_client=None)
-	run = lambda **kw: asyncio.run(tools.registry.execute_action('record_fact', kw, browser_session=sess))  # noqa: E731
+	b = FakeBrowser('Mind2Web: tasks collected from 137 websites spanning 31 domains.', 'https://arxiv.org/abs/2306.06070')
+	tools = tool_runner(S.make_tools(kb, 'longtail', b))
+	run = lambda **kw: tools('record_fact', **kw)  # noqa: E731
 	assert run(claim='sites', value='140', quote='collected from 140 websites').error  # quote not on page
 	assert run(claim='sites', value='140', quote='collected from 137 websites').error  # value not on page
 	assert run(claim='updated', value='12 months ago', quote='12 months ago').error  # time-unstable
@@ -90,47 +81,32 @@ def test_record_fact_rejects_hallucinated_quotes(monkeypatch):
 	assert 'Already recorded' in run(claim='sites again', value='137', quote='from 137 websites spanning').extracted_content
 	assert [f['value'] for f in kb['facts']] == ['137'] and kb['facts'][0]['url'].endswith('2306.06070')
 
-	async def ddg():
-		return 'https://duckduckgo.com/?q=mind2web'
-
-	sess.get_current_page_url = ddg
+	b.at = 'https://duckduckgo.com/?q=mind2web'
 	assert 'not evidence' in run(claim='sites', value='31', quote='spanning 31 domains here').error
 
 
 def test_model_routing(monkeypatch):
-	for k in L.KEYS.values():
-		if k:
-			monkeypatch.delenv(k, raising=False)
-	monkeypatch.setattr(L.shutil, 'which', lambda b: None)  # no local claude CLI unless stated
+	monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+	monkeypatch.setattr(L.shutil, 'which', lambda b: None)  # no local claude / codex CLI unless stated
 	with pytest.raises(RuntimeError):
 		L.resolve('haiku')
 	monkeypatch.setenv('ANTHROPIC_API_KEY', 'x')
 	assert L.resolve('haiku') == ('anthropic', 'claude-haiku-4-5')
-	monkeypatch.setenv('BROWSER_USE_API_KEY', 'x')
-	assert L.resolve('haiku') == ('anthropic', 'claude-haiku-4-5')
-	monkeypatch.delenv('ANTHROPIC_API_KEY')
-	assert L.resolve('haiku') == ('bu', 'anthropic/claude-haiku-4-5')
-	monkeypatch.setenv('OPENROUTER_API_KEY', 'x')
-	assert L.resolve('haiku') == ('openrouter', 'anthropic/claude-haiku-4.5')  # LLM calls prefer OpenRouter: Browser Use credits pay for browsers
-	assert L.resolve('bu') == ('bu', 'bu-2-0')
-	assert L.resolve('bu:bu-2-0-mini-preview') == ('bu', 'bu-2-0-mini-preview')
-	monkeypatch.setattr(L.shutil, 'which', lambda b: '/usr/bin/claude')
+	monkeypatch.setattr(L.shutil, 'which', lambda b: f'/usr/bin/{b}')
+	assert L.resolve('haiku') == ('claude', 'claude-haiku-4-5')  # your Claude account first, the API key is the fallback
 	assert L.resolve('claude-opus') == ('claude', 'opus')
-	with pytest.raises(ValueError):
-		L.make_llm('claude-sonnet')  # browser agents cannot run on claude -p
+	assert L.resolve('gpt') == ('codex', 'gpt-5.5')
+	assert L.resolve('bu') == ('claude', 'claude-sonnet-4-6') and L.resolve('bu-mini') == ('claude', 'claude-haiku-4-5')
 
 
 def test_cost():
 	assert L.cost('anthropic/claude-sonnet-4-6', {'input_tokens': 1e6, 'output_tokens': 0}) == 3.0
 	assert L.cost('anthropic/claude-sonnet-5.5', {'input_tokens': 1e6, 'output_tokens': 1e6}) == 12.0
 	assert L.cost('claude-haiku-4-5', {'input_tokens': 1e6, 'cache_read_input_tokens': 1e6, 'output_tokens': 0}) == pytest.approx(0.1)
-	assert L.cost('bu-2-0', {'input_tokens': 5, 'reported_cost': 0.0085}) == 0.0085
+	assert L.cost('claude-cli:claude-opus-5-5', {'input_tokens': 5, 'reported_cost': 0.0085}) == 0.0085
 	assert L.cost('mystery', {'input_tokens': 5}) is None
-	assert L.usage_dict(NS(total_prompt_tokens=10, total_completion_tokens=2, total_prompt_cached_tokens=0, total_cost=0.0)) == {
-		'input_tokens': 10,
-		'output_tokens': 2,
-		'cache_read_input_tokens': 0,
-	}
+	assert L.cost('modal:Qwen/Qwen3.6-35B-A3B-FP8', {'input_tokens': 1e6, 'output_tokens': 1e6}) is None  # GPU time comes as reported_cost
+	assert L.usage_dict(None) == {} and L.usage_dict({'input_tokens': 1}) == {'input_tokens': 1}
 
 
 def test_untrusted_without_enough_labels():
@@ -204,9 +180,6 @@ def test_source_health_feeds_the_next_plan(monkeypatch):
 
 
 def test_mission_tally_counts_what_was_saved(monkeypatch):
-	import asyncio
-	from types import SimpleNamespace as NS
-
 	import rl_env_use.scout as S
 
 	page = (
@@ -215,16 +188,10 @@ def test_mission_tally_counts_what_was_saved(monkeypatch):
 		+ 'We may need to raise additional capital.'
 	)
 
-	async def page_text(_):
-		return page
+	from conftest import FakeBrowser, tool_runner
 
-	async def url():
-		return 'https://www.sec.gov/a.htm'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
 	kb, tally = {'facts': [], 'ideas': [], 'sources': []}, {}
-	tools = S.make_tools(kb, 'cases', tally=tally)
-	run = lambda n, **kw: asyncio.run(tools.registry.execute_action(n, kw, browser_session=NS(get_current_page_url=url, cdp_client=None)))  # noqa: E731
+	run = tool_runner(S.make_tools(kb, 'cases', FakeBrowser(page, 'https://www.sec.gov/a.htm'), tally=tally))
 	run('record_material', case='acme', title='t', starts_with='ITEM 2. LIQUIDITY', ends_with='raise additional capital.')
 	run('record_fact', claim='cash', value='$4.1 million', quote='Cash fell to $4.1 million while', case='acme')
 	assert tally == {'materials': 1, 'outcomes': 1}
@@ -273,7 +240,7 @@ def test_a_kill_cancels_the_work_so_cleanup_runs():
 		try:
 			await asyncio.sleep(10)
 		finally:
-			done.append('closed')  # where an agent releases its cloud browser
+			done.append('closed')  # where an agent stops its browser
 
 	async def both():
 		threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGINT)).start()

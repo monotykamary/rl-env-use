@@ -1,55 +1,100 @@
-"""Model registry (routes: Browser Use gateway, your Claude account via `claude -p`, Anthropic API, OpenRouter), pricing, structured calls."""
+"""Model registry, pricing, structured calls. No OpenRouter or Browser Use key: every route runs on what is already here.
+
+claude     your Claude account through the local Claude Code CLI (`claude -p`)
+codex      your ChatGPT account through the local Codex CLI (`codex exec`)
+modal      open-weight models served by vLLM on a Modal GPU: started on first use, stopped when the command ends or idles
+anthropic  the Anthropic API, only when ANTHROPIC_API_KEY is set (a fallback route for the Claude models)
+"""
 
 import asyncio
 import json
 import os
 import random
 import shutil
-import threading
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
-from browser_use import ChatAnthropic
-from browser_use.llm.exceptions import ModelProviderError
-from browser_use.llm.messages import SystemMessage, UserMessage
-from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
-KEYS = {'bu': 'BROWSER_USE_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY', 'openrouter': 'OPENROUTER_API_KEY', 'claude': None}  # claude = local `claude -p` (your Claude account)
-# alias -> candidate (route, model id), first route with a key wins. LLM calls go to OpenRouter first, so Browser Use
-# credits pay only for browsers (and the bu models, which live only there); the gateway is the fallback route.
+from . import cloud, net
+
+NEEDS = {
+	'claude': 'the Claude Code CLI (`claude`) on PATH, signed in',
+	'codex': 'the Codex CLI (`codex`) on PATH, signed in',
+	'modal': 'a Modal token (`modal token new`)',
+	'anthropic': 'ANTHROPIC_API_KEY',
+}
+
+
+def available(route: str) -> bool:
+	if route in ('claude', 'codex'):
+		return bool(shutil.which(route))
+	if route == 'modal':
+		return cloud.configured()
+	return bool(os.getenv('ANTHROPIC_API_KEY')) if route == 'anthropic' else False
+
+
+# alias -> candidate (route, model id), first available route wins; the next one is the fallback for an outage
 MODELS = {
-	'bu': [('bu', 'bu-2-0')],
-	'bu-mini': [('bu', 'bu-2-0-mini-preview')],
-	'haiku': [('openrouter', 'anthropic/claude-haiku-4.5'), ('anthropic', 'claude-haiku-4-5'), ('bu', 'anthropic/claude-haiku-4-5')],
-	'sonnet46': [('openrouter', 'anthropic/claude-sonnet-4.6'), ('anthropic', 'claude-sonnet-4-6'), ('bu', 'anthropic/claude-sonnet-4-6')],
-	'sonnet5': [('openrouter', 'anthropic/claude-sonnet-5'), ('anthropic', 'claude-sonnet-5'), ('bu', 'anthropic/claude-sonnet-5')],
-	'opus5': [('openrouter', 'anthropic/claude-opus-5'), ('anthropic', 'claude-opus-5'), ('bu', 'anthropic/claude-opus-5')],
-	'gpt': [('openrouter', 'openai/gpt-5.5'), ('bu', 'openai/gpt-5.5')],
-	# text-only structured calls through the local Claude Code CLI (`claude -p`, billed to your Claude account)
+	'haiku': [('claude', 'claude-haiku-4-5'), ('anthropic', 'claude-haiku-4-5')],
+	'sonnet46': [('claude', 'claude-sonnet-4-6'), ('anthropic', 'claude-sonnet-4-6')],
+	'sonnet5': [('claude', 'claude-sonnet-5'), ('anthropic', 'claude-sonnet-5')],
+	'sonnet55': [('claude', 'claude-sonnet-5-5'), ('anthropic', 'claude-sonnet-5-5')],
+	'opus5': [('claude', 'claude-opus-5'), ('anthropic', 'claude-opus-5')],
+	'opus55': [('claude', 'claude-opus-5-5'), ('anthropic', 'claude-opus-5-5')],
+	'fable': [('claude', 'claude-fable-5-1'), ('anthropic', 'claude-fable-5-1')],
+	# the latest of each family, whatever the Claude Code CLI resolves them to
 	'claude-sonnet': [('claude', 'sonnet')],
 	'claude-opus': [('claude', 'opus')],
 	'claude-haiku': [('claude', 'haiku')],
-	# OpenRouter: other labs' frontier models (difficulty panel, adjudication) and open-weight policies to train
-	'opus55': [('openrouter', 'anthropic/claude-opus-5.5')],
-	'sonnet55': [('openrouter', 'anthropic/claude-sonnet-5.5')],
-	'gpt-astra': [('openrouter', 'openai/gpt-6-astra')],
-	'gpt6': [('openrouter', 'openai/gpt-6.1-sol')],
-	'gemini': [('openrouter', 'google/gemini-3.1-pro-preview')],
-	'gemini-flash': [('openrouter', 'google/gemini-3.8-flash')],
-	'grok': [('openrouter', 'x-ai/grok-4.7')],
-	'deepseek': [('openrouter', 'deepseek/deepseek-v4-pro')],
-	'qwen-27b': [('openrouter', 'qwen/qwen3.8-27b')],
-	'qwen-35b': [('openrouter', 'qwen/qwen3.6-35b-a3b')],
+	# OpenAI's frontier through your ChatGPT account (difficulty panel, adjudication)
+	'gpt': [('codex', 'gpt-5.5')],
+	'gpt-astra': [('codex', 'gpt-6-astra')],
+	'gpt6': [('codex', 'gpt-6.1-sol')],
+	# open-weight policies to train, served on Modal (any Hugging Face model also works as modal:<org>/<name>)
+	'qwen-27b': [('modal', 'Qwen/Qwen3.8-27B-FP8')],
+	'qwen-35b': [('modal', 'Qwen/Qwen3.6-35B-A3B-FP8')],
+	# envs mined before the switch name Browser Use's gateway models: their missions now run on Claude
+	'bu': [('claude', 'claude-sonnet-4-6')],
+	'bu-mini': [('claude', 'claude-haiku-4-5')],
 }
+# what runs before the switch recorded as each alias's model (OpenRouter / Browser Use gateway ids): their slots stay theirs
+LEGACY_IDS = {
+	'haiku': ['anthropic/claude-haiku-4.5', 'anthropic/claude-haiku-4-5'],
+	'sonnet46': ['anthropic/claude-sonnet-4.6', 'anthropic/claude-sonnet-4-6'],
+	'sonnet5': ['anthropic/claude-sonnet-5'],
+	'opus5': ['anthropic/claude-opus-5'],
+	'opus55': ['anthropic/claude-opus-5.5'],
+	'sonnet55': ['anthropic/claude-sonnet-5.5'],
+	'gpt': ['openai/gpt-5.5'],
+	'gpt-astra': ['openai/gpt-6-astra'],
+	'gpt6': ['openai/gpt-6.1-sol'],
+	'qwen-27b': ['qwen/qwen3.8-27b'],
+	'qwen-35b': ['qwen/qwen3.6-35b-a3b'],
+	'bu': ['bu-2-0'],
+	'bu-mini': ['bu-2-0-mini-preview'],
+}
+LABELS = {'claude': 'claude-cli', 'codex': 'codex', 'modal': 'modal', 'anthropic': 'anthropic'}  # the route prefix a result row records
+
+
+def model_ids(alias: str) -> set[str]:
+	"""Every model id a result row may carry for this alias, on any route, now or before the switch."""
+	return {alias, *LEGACY_IDS.get(alias, [])} | {x for r, m in MODELS.get(alias, []) for x in (m, f'{LABELS[r]}:{m}')}
+
+
+# vLLM serving per open-weight model: GPU and flags (RLENV_MODAL_GPU / RLENV_VLLM_ARGS override for any model)
+QWEN_ARGS = ['--max-model-len', '131072', '--gpu-memory-utilization', '0.92', '--reasoning-parser', 'qwen3', '--enable-auto-tool-choice', '--tool-call-parser', 'qwen3_coder']
+QWEN_ARGS += ['--language-model-only', '--enable-prefix-caching']
+SERVING = {'Qwen/Qwen3.8-27B-FP8': ('H100', QWEN_ARGS), 'Qwen/Qwen3.6-35B-A3B-FP8': ('H100', QWEN_ARGS)}
 # Frontier closed models: they reason internally at high effort and return only the answer. They decline requests to
 # write their reasoning out (a safeguard against copying their outputs), and the grade needs only the answer.
-ANSWER_ONLY = {'opus55', 'sonnet55', 'gpt-astra'}
-# $/MTok (input, output), matched by substring in order. Cache reads 0.1x input, writes 1.25x input.
-# bu-2-0: fitted exactly to the gateway's reported cost over 9 mining runs (Oct 2026); bu-2-0-mini: unknown.
-# OpenRouter calls carry their billed cost; these rows only rank models by strength (audit) and price old rows.
+ANSWER_ONLY = {'opus55', 'sonnet55', 'gpt-astra', 'fable'}
+# $/MTok (input, output), matched by substring in order. Cache reads 0.1x input, writes 1.25x input. `claude -p` reports
+# its API-equivalent cost and Modal models carry their GPU time, so these rows price codex calls, rank models by
+# strength (audit) and price old rows.
 PRICES = [
 	('bu-2-0-mini', None),
 	('bu-2-0', (0.6, 3.5)),
@@ -73,18 +118,37 @@ PRICES = [
 ]
 
 
+class ModelProviderError(RuntimeError):
+	def __init__(self, message: str, status_code: int = 500, model: str = ''):
+		super().__init__(message)
+		self.message, self.status_code, self.model = message, status_code, model
+
+
+@dataclass
+class SystemMessage:
+	content: str
+	role: str = 'system'
+
+
+@dataclass
+class UserMessage:
+	content: str
+	role: str = 'user'
+
+
 def routes(name: str) -> list[tuple[str, str]]:
-	"""Every route of an alias that has a key, in preference order; an explicit 'route:model_id' is its only route."""
-	if ':' in name and name.split(':', 1)[0] in KEYS:
+	"""Every available route of an alias, in preference order; an explicit 'route:model_id' is its only route."""
+	if ':' in name and name.split(':', 1)[0] in NEEDS:
 		return [tuple(name.split(':', 1))]
-	return [(r, m) for r, m in MODELS.get(name, []) if (shutil.which('claude') if r == 'claude' else os.getenv(KEYS[r]))]
+	return [(r, m) for r, m in MODELS.get(name, []) if available(r)]
 
 
 def resolve(name: str) -> tuple[str, str]:
-	"""alias ('haiku') or explicit 'route:model_id' ('bu:bu-2-0', 'anthropic:claude-opus-5-5')."""
+	"""alias ('haiku') or explicit 'route:model_id' ('claude:claude-opus-5-5', 'modal:Qwen/Qwen3.6-27B')."""
 	if rs := routes(name):
 		return rs[0]
-	raise RuntimeError(f'no API key for model {name!r} (need one of {[KEYS[r] for r, _ in MODELS.get(name, [])] or list(KEYS.values())})')
+	need = [NEEDS[r] for r, _ in MODELS.get(name, [])] if name in MODELS else [f'a known alias ({", ".join(MODELS)}) or route:model_id with route in {list(NEEDS)}']
+	raise RuntimeError(f'no route for model {name!r} (need {" or ".join(dict.fromkeys(need))})')
 
 
 def first_json(txt: str):
@@ -111,226 +175,278 @@ def loads_lenient(txt: str):
 	raise ValueError(f'unparseable structured field: {txt[:120]}')
 
 
-class ClaudeCLI:
-	"""Plain structured calls through `claude -p` (no tools, our own system prompt). For text-only stages (case
-	building, critic, judges) - not for browser agents, which send screenshots every step."""
+def schema_prompt(output_format) -> str:
+	return f'\n\nReply with ONLY a JSON object matching this JSON schema (no prose, no code fence):\n{json.dumps(output_format.model_json_schema())}'
 
-	sem = asyncio.Semaphore(int(os.getenv('RLENV_CLAUDE_CONCURRENCY', '4')))
+
+def parse_structured(txt: str, output_format):
+	txt = txt.strip()
+	try:
+		obj = loads_lenient(txt[txt.find('{') : txt.rfind('}') + 1] if '{' in txt else txt)
+	except ValueError:
+		obj = first_json(txt)  # JSON followed by more text, e.g. a repeated final answer
+	return output_format.model_validate(obj)
+
+
+def split_messages(messages) -> tuple[str, str]:
+	system = '\n'.join(str(m.content) for m in messages if getattr(m, 'role', '') == 'system')
+	return system, '\n\n'.join(str(m.content) for m in messages if getattr(m, 'role', '') != 'system')
+
+
+# Claude Code without the user's settings, hooks, MCP servers, skills or session files: a plain model call
+CLAUDE_BARE = ['--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence']
+
+
+class ClaudeCLI:
+	"""Plain structured calls through `claude -p` (no tools, our own system prompt), billed to your Claude account. The
+	reported cost is the API-equivalent list price: it is what the budget counts."""
+
+	sem = asyncio.Semaphore(int(os.getenv('RLENV_CLAUDE_CONCURRENCY', '8')))
 
 	def __init__(self, model: str):
 		self.model = f'claude-cli:{model}'
 		self.cli_model = model
 
 	async def ainvoke(self, messages, output_format=None, **kwargs):
-		system = '\n'.join(m.content for m in messages if getattr(m, 'role', '') == 'system') or 'You are a precise assistant.'
-		user = '\n\n'.join(str(m.content) for m in messages if getattr(m, 'role', '') != 'system')
+		system, user = split_messages(messages)
 		if output_format is not None:
-			user += f'\n\nReply with ONLY a JSON object matching this JSON schema (no prose, no code fence):\n{json.dumps(output_format.model_json_schema())}'
-		args = [
-			'claude',
-			'-p',
-			'--model',
-			self.cli_model,
-			'--output-format',
-			'json',
-			'--system-prompt',
-			system,
-			'--disallowedTools',
-			'Bash,Edit,Write,Read,WebFetch,WebSearch,Task,Glob,Grep',
-		]
-		async with self.sem:  # prompt on stdin: --disallowedTools is variadic and would swallow a positional prompt
-			proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd='/tmp')
+			user += schema_prompt(output_format)
+		args = ['claude', '-p', '--model', self.cli_model, '--output-format', 'json', '--system-prompt', system or 'You are a precise assistant.', '--tools', '', *CLAUDE_BARE]
+		async with self.sem:  # prompt on stdin: a long prompt as an argument outgrows the OS limit
+			proc = await asyncio.create_subprocess_exec(
+				*args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=tempfile.gettempdir()
+			)
 			try:
-				out, err = await asyncio.wait_for(proc.communicate(user.encode()), 300)
+				out, err = await asyncio.wait_for(proc.communicate(user.encode()), CALL_TIMEOUT)
 			except (TimeoutError, asyncio.CancelledError):
 				proc.kill()
 				raise
-		w = json.loads(out or b'{}')
+		try:
+			w = json.loads(out or b'{}')
+		except ValueError:
+			w = {'is_error': True, 'result': (out or err).decode()[:300]}
 		if w.get('is_error') or 'result' not in w:
-			raise ModelProviderError(message=f'claude -p failed: {(w.get("result") or err.decode())[:200]}', status_code=500, model=self.model)
-		u = w.get('usage', {})
-		pt = u.get('input_tokens', 0) + u.get('cache_read_input_tokens', 0) + u.get('cache_creation_input_tokens', 0)
-		usage = ChatInvokeUsage(
-			prompt_tokens=pt,
-			prompt_cached_tokens=u.get('cache_read_input_tokens', 0),
-			prompt_cache_creation_tokens=u.get('cache_creation_input_tokens'),
-			prompt_image_tokens=None,
-			completion_tokens=u.get('output_tokens', 0),
-			total_tokens=pt + u.get('output_tokens', 0),
-		)
+			raise ModelProviderError(f'claude -p failed: {(w.get("result") or err.decode())[:200]}', 500, self.model)
+		usage = claude_usage(w)
 		if output_format is None:
-			return ChatInvokeCompletion(completion=w['result'], usage=usage)
-		txt = w['result'].strip()
-		txt = txt[txt.find('{') : txt.rfind('}') + 1] if '{' in txt else txt
-		return ChatInvokeCompletion(completion=output_format.model_validate(loads_lenient(txt)), usage=usage)
+			return SimpleNamespace(completion=w['result'], usage=usage)
+		try:
+			return SimpleNamespace(completion=parse_structured(w['result'], output_format), usage=usage)
+		except Exception:
+			LEDGER.add(self.model, usage)  # an unparseable reply is still billed; call() books only the one it returns
+			raise
 
 
-class GatewayStructured:
-	"""Plain structured calls on the Browser Use gateway (billed to the Browser Use account). The gateway serves
-	agent-step outputs only, so the schema travels as the single custom action of a browser-use agent step and is
-	unwrapped again; no browser is involved."""
+def claude_usage(w: dict) -> dict:
+	u = w.get('usage') or {}
+	read, write = u.get('cache_read_input_tokens', 0) or 0, u.get('cache_creation_input_tokens', 0) or 0
+	return {
+		'input_tokens': (u.get('input_tokens', 0) or 0) + read + write,
+		'output_tokens': u.get('output_tokens', 0) or 0,
+		'cache_read_input_tokens': read,
+		'cache_creation_input_tokens': write,
+		'reported_cost': w.get('total_cost_usd') or 0,
+	}
 
-	_types: dict = {}
+
+CODEX_BARE = ['--json', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules']
+
+
+def codex_events(out: bytes) -> tuple[str, dict, str]:
+	"""(last agent message, usage, error) from `codex exec --json` events."""
+	text, usage, error = '', {}, ''
+	for line in out.decode(errors='replace').splitlines():
+		d = json.loads(line) if line.startswith('{') else {}
+		if d.get('type') == 'item.completed' and d.get('item', {}).get('type') == 'agent_message':
+			text = d['item'].get('text') or ''
+		elif d.get('type') == 'turn.completed':
+			u = d.get('usage') or {}
+			usage = add_usage(
+				usage, {'input_tokens': u.get('input_tokens', 0), 'output_tokens': u.get('output_tokens', 0), 'cache_read_input_tokens': u.get('cached_input_tokens', 0)}
+			)
+		elif d.get('type') in ('error', 'turn.failed'):
+			error = str(d.get('message') or d.get('error') or d)[:300]
+	return text, usage, error
+
+
+class CodexCLI:
+	"""Plain structured calls through `codex exec` (read-only sandbox, none of the user's config), billed to your ChatGPT
+	account. Codex reports tokens, not dollars: PRICES turns them into the API-equivalent cost the budget counts."""
+
+	sem = asyncio.Semaphore(int(os.getenv('RLENV_CODEX_CONCURRENCY', '4')))
+
+	def __init__(self, model: str, effort: str | None = None):
+		self.model, self.cli_model, self.effort = f'codex:{model}', model, effort
+
+	async def ainvoke(self, messages, output_format=None, **kwargs):
+		system, user = split_messages(messages)
+		prompt = (f'{system}\n\n' if system else '') + user + (schema_prompt(output_format) if output_format is not None else '')
+		args = ['codex', 'exec', *CODEX_BARE, '-s', 'read-only', '-m', self.cli_model, *(['-c', f'model_reasoning_effort="{self.effort}"'] if self.effort else []), '-']
+		async with self.sem:
+			proc = await asyncio.create_subprocess_exec(
+				*args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=tempfile.gettempdir()
+			)
+			try:
+				out, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CALL_TIMEOUT)
+			except (TimeoutError, asyncio.CancelledError):
+				proc.kill()
+				raise
+		text, usage, error = codex_events(out)
+		if proc.returncode or error or not text:
+			raise ModelProviderError(f'codex exec failed: {(error or err.decode() or "no reply")[:200]}', 500, self.model)
+		if output_format is None:
+			return SimpleNamespace(completion=text, usage=usage)
+		try:
+			return SimpleNamespace(completion=parse_structured(text, output_format), usage=usage)
+		except Exception:
+			LEDGER.add(self.model, usage)
+			raise
+
+
+class ModalServer:
+	"""One vLLM server per open-weight model, started on first use and shared by every call of the command. Modal stops
+	it after RLENV_LLM_IDLE_S without requests (then the next call starts it again) and at the end of the command."""
+
+	servers: dict = {}
+	BOOT_TIMEOUT = 45 * 60  # first start of a large model: image build, weight download, CUDA graph capture
 
 	def __init__(self, model: str):
-		from browser_use import ChatBrowserUse
-
-		self.llm, self.model = ChatBrowserUse(model=model), model
-
-	@staticmethod
-	def nested_fields(schema: type[BaseModel]) -> dict:
-		"""Fields holding models (directly or in lists/dicts): the gateway flattens nested objects, so they travel as JSON strings."""
-		import typing
-
-		out = {}
-		for name, f in schema.model_fields.items():
-			ann = f.annotation
-			args = [a for a in typing.get_args(ann) if a is not type(None)]
-			base = args[0] if typing.get_origin(ann) in (typing.Union, type(int | None)) and args else ann
-			inner = (typing.get_args(base) or [base])[-1]  # list[X] / dict[str, X] -> X
-			if isinstance(inner, type) and issubclass(inner, BaseModel):  # primitive lists travel fine; nested objects get flattened
-				out[name] = ann
-		return out
+		self.model, self.live, self.base, self.key, self.inflight, self.ready = model, None, None, None, 0, False
+		self.loop, self.lock = asyncio.get_running_loop(), asyncio.Lock()
 
 	@classmethod
-	def wire_schema(cls, schema: type[BaseModel]) -> type[BaseModel]:
-		from pydantic import TypeAdapter, create_model
+	async def get(cls, model: str) -> 'ModalServer':
+		s = cls.servers.get(model)
+		if s is None or s.loop is not asyncio.get_running_loop():  # each command's event loop starts its own (the last one stopped with it)
+			s = cls.servers[model] = cls(model)
+		await s.ensure()
+		return s
 
-		nested = cls.nested_fields(schema)
-		if not nested:
-			return schema
-		fields = {}
-		for name, f in schema.model_fields.items():
-			if name in nested:
-				js = json.dumps(TypeAdapter(nested[name]).json_schema(), separators=(',', ':'))
-				fields[name] = (str, Field(description=f'{f.description or name} - a JSON value matching this JSON schema: {js}'))
-			else:
-				fields[name] = (f.annotation, f)
-		return create_model(schema.__name__ + 'Wire', **fields)
+	def serving(self) -> tuple[str, list[str]]:
+		gpu, args = SERVING.get(self.model, ('H100', ['--max-model-len', '65536', '--enable-prefix-caching']))
+		return os.getenv('RLENV_MODAL_GPU', gpu), (os.getenv('RLENV_VLLM_ARGS', '').split() or args)
 
-	@classmethod
-	def step_type(cls, schema: type[BaseModel]):
-		schema = cls.wire_schema(schema)
-		if schema not in cls._types:
-			from browser_use import Tools
-			from browser_use.agent.views import ActionResult, AgentOutput
-
-			tools = Tools(exclude_actions=list(Tools().registry.registry.actions))
-
-			@tools.registry.action('Submit your complete answer in this structure (call exactly once).', param_model=schema)
-			async def submit(params):  # never executed: only its schema is used
-				return ActionResult(is_done=True)
-
-			cls._types[schema] = AgentOutput.type_with_custom_actions(tools.registry.create_action_model())
-		return cls._types[schema]
-
-	async def ainvoke(self, messages, output_format=None, **kwargs):
-		if output_format is None:
-			return await self.llm.ainvoke(messages, None, **kwargs)
-		msgs = (
-			[*messages[:-1], messages[-1].model_copy(update={'content': f'{messages[-1].content}\n\nRespond by calling the submit action exactly once.'})] if messages else messages
-		)
-		r = await self.llm.ainvoke(msgs, output_format=self.step_type(output_format), **kwargs)
-		payload = next((a.model_dump(exclude_none=True).get('submit') for a in r.completion.action if a.model_dump(exclude_none=True).get('submit')), None)
-		if payload is None:
-			raise ModelProviderError(message='gateway response had no submit action', status_code=500, model=self.model)
-		for name in self.nested_fields(output_format):
-			if isinstance(payload.get(name), str):
-				txt = payload[name].strip()
-				txt = txt.split('\n', 1)[1].rsplit('```', 1)[0] if txt.startswith('```') else txt
-				payload[name] = loads_lenient(txt)
-		return ChatInvokeCompletion(completion=output_format.model_validate(payload), usage=r.usage)
-
-
-class OpenRouter:
-	"""Plain structured calls on OpenRouter: the schema travels in the prompt (not every provider enforces
-	response_format), the reply is parsed leniently, and the billed cost comes back with the usage."""
-
-	sem = asyncio.Semaphore(int(os.getenv('RLENV_OPENROUTER_CONCURRENCY', '16')))
-	pool = None  # requests run in threads: cancelling an awaited httpx request closes its TLS stream in a shielded section,
-	local = threading.local()  # and a peer that never finishes the close froze whole climbs (every slot, every timeout)
-
-	@classmethod
-	def post(cls, body: dict):
+	async def probe(self) -> bool:
+		"""Serving for real: the model is listed and a one-token completion comes back. vLLM answers /health while its
+		engine is still compiling kernels, and a request then is reset."""
 		import httpx
 
-		c = getattr(cls.local, 'client', None)
-		if c is None or getattr(c, 'is_closed', False) or type(c) is not httpx.Client:
-			c = cls.local.client = httpx.Client(timeout=httpx.Timeout(CALL_TIMEOUT, connect=30))
-		return c.post('https://openrouter.ai/api/v1/chat/completions', headers={'Authorization': f'Bearer {os.environ[KEYS["openrouter"]]}'}, json=body)
+		h = {'Authorization': f'Bearer {self.key}'}
+		try:
+			r = await asyncio.to_thread(httpx.get, f'{self.base}/v1/models', headers=h, timeout=15)
+			if r.status_code != 200 or self.model not in r.text:
+				return False
+			body = {'model': self.model, 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1}
+			r = await asyncio.to_thread(httpx.post, f'{self.base}/v1/chat/completions', headers=h, json=body, timeout=120)
+			return r.status_code == 200
+		except Exception:
+			return False
 
-	def __init__(self, model: str, temperature: float | None = None, effort: str | None = None):
-		self.model, self.temperature, self.effort = model, temperature, effort
+	async def ensure(self) -> None:
+		async with self.lock:
+			alive = self.live is not None and self.live.sb.object_id in cloud.LIVE and await self.live.sb.poll.aio() is None
+			if alive and self.ready:
+				return
+			if not alive:  # first use, or Modal stopped it when idle: start it (again)
+				await cloud.terminate(self.live)
+				gpu, args = self.serving()
+				self.live, self.base, self.key = await cloud.vllm_sandbox(self.model, gpu, args)
+			self.ready, t0 = False, time.monotonic()
+			while time.monotonic() - t0 < self.BOOT_TIMEOUT:
+				if (rc := await self.live.sb.poll.aio()) is not None:
+					logs = ''
+					try:
+						logs = (await self.live.sb.stderr.read.aio())[-800:]
+					except Exception:
+						pass
+					await cloud.terminate(self.live)
+					raise ModelProviderError(f'vLLM for {self.model} exited with {rc}: {logs}', 500, f'modal:{self.model}')
+				if await self.probe():
+					self.ready = True
+					return
+				await asyncio.sleep(10)
+			await cloud.terminate(self.live)
+			raise ModelProviderError(f'vLLM for {self.model} not ready after {self.BOOT_TIMEOUT // 60} min', 504, f'modal:{self.model}')
 
-	async def ainvoke(self, messages, output_format=None, **kwargs):
-		msgs = [{'role': getattr(m, 'role', 'user'), 'content': str(m.content)} for m in messages]
-		if output_format is not None:
-			msgs[-1]['content'] += f'\n\nReply with ONLY a JSON object matching this JSON schema (no prose, no code fence):\n{json.dumps(output_format.model_json_schema())}'
-		body = {'model': self.model, 'messages': msgs, 'usage': {'include': True}, 'max_tokens': 32000} | (
-			{'temperature': self.temperature} if self.temperature is not None and not self.effort else {}
-		)
-		body |= {'reasoning': {'effort': self.effort, 'exclude': True}} if self.effort else {}
-		if output_format is not None and self.model.startswith('google/'):  # Gemini sometimes echoes the schema instead of filling it
-			body['response_format'] = {'type': 'json_schema', 'json_schema': {'name': output_format.__name__, 'strict': False, 'schema': output_format.model_json_schema()}}
-		if OpenRouter.pool is None:
-			from concurrent.futures import ThreadPoolExecutor
 
-			OpenRouter.pool = ThreadPoolExecutor(64, thread_name_prefix='openrouter')
-		async with self.sem:  # a timeout or cancellation returns at once; the thread finishes or times out on its own
-			r = await asyncio.get_running_loop().run_in_executor(OpenRouter.pool, OpenRouter.post, body)
+class OpenAICompat:
+	"""Chat completions on an OpenAI-compatible server: a Modal vLLM server, or the Anthropic API's compatible endpoint.
+	Structured calls carry the schema in the prompt (not every server enforces response_format) and parse leniently;
+	agents use `chat` with tools. A Modal call carries its share of the GPU time as its cost."""
+
+	sem = asyncio.Semaphore(int(os.getenv('RLENV_OPENAI_CONCURRENCY', '16')))
+
+	def __init__(self, route: str, model: str, temperature: float | None = None):
+		self.route, self.mid, self.temperature = route, model, temperature
+		self.model = f'{route}:{model}'
+
+	async def chat(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int = 32000) -> tuple[dict, dict, str]:
+		"""(assistant message, usage, finish reason)."""
+		server = None
+		if self.route == 'modal':
+			server = await ModalServer.get(self.mid)
+			url, headers = f'{server.base}/v1/chat/completions', {'Authorization': f'Bearer {server.key}'}
+		else:
+			url, headers = 'https://api.anthropic.com/v1/chat/completions', {'Authorization': f'Bearer {os.environ["ANTHROPIC_API_KEY"]}'}
+		body = {'model': self.mid, 'messages': messages, 'max_tokens': max_tokens} | ({'temperature': self.temperature} if self.temperature is not None else {})
+		body |= {'tools': tools, 'tool_choice': 'auto'} if tools else {}
+		async with self.sem:
+			t0, share = time.monotonic(), 0.0
+			if server:
+				server.inflight += 1
+			try:
+				r = await net.post(url, body, headers, CALL_TIMEOUT)
+			except Exception as e:
+				if server and not isinstance(e, TimeoutError):  # a dropped connection: the next attempt re-checks the server first
+					server.ready = False
+				raise ModelProviderError(f'{self.route} connection: {type(e).__name__}: {e}'[:300], 503, self.model) from e
+			finally:
+				if server:
+					share = server.live.rate * (time.monotonic() - t0) / max(1, server.inflight)  # concurrent requests split the GPU's time
+					server.inflight -= 1
+					server.live.allocated += share
 		w = r.json() if r.headers.get('content-type', '').startswith('application/json') else {'error': {'message': r.text[:300]}}
 		if r.status_code != 200 or w.get('error') or not w.get('choices'):
-			raise ModelProviderError(message=f'openrouter {r.status_code}: {str(w.get("error") or w)[:300]}', status_code=r.status_code, model=self.model)
+			raise ModelProviderError(f'{self.route} {r.status_code}: {str(w.get("error") or w)[:300]}', r.status_code, self.model)
 		u = w.get('usage') or {}
 		usage = {
 			'input_tokens': u.get('prompt_tokens', 0),
 			'output_tokens': u.get('completion_tokens', 0),
 			'cache_read_input_tokens': (u.get('prompt_tokens_details') or {}).get('cached_tokens', 0) or 0,
-			'reported_cost': u.get('cost') or 0,
-		}
-		txt = (w['choices'][0]['message'].get('content') or '').strip()
-		if w['choices'][0].get('finish_reason') == 'content_filter' or (not txt and w['choices'][0].get('native_finish_reason') == 'refusal'):
-			raise ModelProviderError(message='stop_reason refusal: declined to respond', status_code=400, model=self.model)
+		} | ({'reported_cost': share} if server else {})
+		return w['choices'][0]['message'], usage, w['choices'][0].get('finish_reason') or ''
+
+	async def ainvoke(self, messages, output_format=None, **kwargs):
+		msgs = [{'role': getattr(m, 'role', 'user'), 'content': str(m.content)} for m in messages]
 		if output_format is not None:
-			try:
-				try:
-					obj = loads_lenient(txt[txt.find('{') : txt.rfind('}') + 1] if '{' in txt else txt)
-				except ValueError:
-					obj = first_json(txt)  # JSON followed by more text, e.g. a repeated final answer
-				txt = output_format.model_validate(obj)
-			except Exception:
-				LEDGER.add(self.model, usage)  # an unparseable reply is still billed; call() books only the one it returns
-				raise
-		return SimpleNamespace(completion=txt, usage=usage)  # usage: a plain dict, so the billed cost survives
+			msgs[-1]['content'] += schema_prompt(output_format)
+		msg, usage, finish = await self.chat(msgs)
+		txt = (msg.get('content') or '').strip()
+		if finish == 'content_filter' or (not txt and msg.get('refusal')):
+			raise ModelProviderError('stop_reason refusal: declined to respond', 400, self.model)
+		if output_format is None:
+			return SimpleNamespace(completion=txt, usage=usage)
+		try:
+			return SimpleNamespace(completion=parse_structured(txt, output_format), usage=usage)
+		except Exception:
+			LEDGER.add(self.model, usage)
+			raise
 
 
-def make_llm(name: str, temperature: float | None = None, agent: bool = True, fallback: bool = False):
-	"""agent=True: an LLM for browser-use agents. agent=False: plain structured calls (Browser Use gateway via
-	GatewayStructured when a Browser Use key is set, or `claude -p` for claude-* models). fallback: the alias's next route."""
+def make_llm(name: str, temperature: float | None = None, fallback: bool = False):
+	"""A client for plain structured calls. fallback: the alias's next route (the same model elsewhere)."""
 	rs = routes(name) or [resolve(name)]
 	route, mid = rs[min(int(fallback), len(rs) - 1)]
 	if route == 'claude':
-		if agent:
-			raise ValueError('claude -p models serve text-only structured calls, not browser agents (screenshots every step)')
 		return ClaudeCLI(mid)
-	if route == 'bu':
-		if not agent:
-			return GatewayStructured(mid)
-		from browser_use import ChatBrowserUse
-
-		return ChatBrowserUse(model=mid)
-	if route == 'openrouter':
-		if not agent:
-			return OpenRouter(mid, temperature, 'high' if name in ANSWER_ONLY else None)
-		from browser_use.llm.openrouter.chat import ChatOpenRouter
-
-		return ChatOpenRouter(model=mid, api_key=os.environ[KEYS['openrouter']])
-	return ChatAnthropic(model=mid, temperature=temperature)
+	if route == 'codex':
+		return CodexCLI(mid, 'high' if name in ANSWER_ONLY else None)
+	return OpenAICompat(route, mid, temperature)
 
 
 def price_of(model: str) -> tuple[float, float] | None:
 	m = (model or '').lower()
-	return next((p for k, p in PRICES if k in m), None) if m else None
+	return next((p for k, p in PRICES if k in m), None) if m and not m.startswith('modal') else None  # Modal: GPU time, not tokens
 
 
 def cost(model: str, usage: dict) -> float | None:
@@ -349,12 +465,7 @@ def cost(model: str, usage: dict) -> float | None:
 def usage_dict(u) -> dict:
 	if u is None:
 		return {}
-	if isinstance(u, dict):  # OpenRouter: already ours, with the billed cost
-		return u
-	if hasattr(u, 'total_prompt_tokens'):  # browser_use UsageSummary (cost filled by the gateway for bu-* models)
-		d = {'input_tokens': u.total_prompt_tokens, 'output_tokens': u.total_completion_tokens, 'cache_read_input_tokens': u.total_prompt_cached_tokens}
-		return d | ({'reported_cost': u.total_cost} if u.total_cost else {})
-	return {'input_tokens': u.prompt_tokens, 'output_tokens': u.completion_tokens, 'cache_read_input_tokens': u.prompt_cached_tokens or 0}
+	return dict(u)  # every client returns a plain dict, with the billed cost when the route reports one
 
 
 def add_usage(a: dict, b: dict) -> dict:
@@ -378,31 +489,9 @@ class Ledger:
 
 
 LEDGER = Ledger()
-BU_CLOUD = 'browser-use cloud (balance)'  # what the account was charged beyond the agents' tokens: cloud browsers, proxies
 
 
-def bu_balance() -> float | None:
-	"""The Browser Use account's credit balance: the ground truth for what mining cost."""
-	if not os.getenv(KEYS['bu']):
-		return None
-	try:
-		import httpx
-
-		r = httpx.get('https://api.browser-use.com/api/v2/billing/account', headers={'X-Browser-Use-API-Key': os.environ[KEYS['bu']]}, timeout=10)
-		return float(r.json()['totalCreditsBalanceUsd'])
-	except Exception:
-		return None
-
-
-def book_bu(start: float | None) -> None:
-	"""Charge LEDGER with the Browser Use spend its token counts miss (cloud browser time), measured on the balance."""
-	now = bu_balance() if start is not None else None
-	if now is not None:
-		booked = sum(cost(m, u) or 0 for m, u in list(LEDGER.by_model.items()) if m.startswith('bu-'))
-		LEDGER.by_model[BU_CLOUD] = {'reported_cost': max(0.0, start - now - booked)}
-
-
-CALL_TIMEOUT = 600  # a hung gateway connection otherwise stalls a whole stage (long structured outputs take minutes)
+CALL_TIMEOUT = 600  # a hung connection or CLI otherwise stalls a whole stage (long structured outputs take minutes)
 
 
 async def call(name: str, system: str, user: str, schema: type[BaseModel], retries: int = 4, temperature: float | None = 0.0):
@@ -411,8 +500,8 @@ async def call(name: str, system: str, user: str, schema: type[BaseModel], retri
 	feedback = ''
 	for attempt in range(retries):
 		# a deterministic (temperature 0) failure would repeat identically: later attempts resample
-		# the last attempts go to the alias's next route (the same model elsewhere): one gateway's outage is not the model's
-		llm = make_llm(name, temperature if attempt == 0 or temperature is None else 0.7, agent=False, fallback=attempt >= retries - 2)  # None: the model's own sampling, kept
+		# the last attempts go to the alias's next route (the same model elsewhere): one route's outage is not the model's
+		llm = make_llm(name, temperature if attempt == 0 or temperature is None else 0.7, fallback=attempt >= retries - 2)  # None: the model's own sampling, kept
 		try:
 			r = await asyncio.wait_for(llm.ainvoke([SystemMessage(content=system), UserMessage(content=user + feedback)], output_format=schema), CALL_TIMEOUT)
 			u = usage_dict(r.usage)
@@ -423,8 +512,8 @@ async def call(name: str, system: str, user: str, schema: type[BaseModel], retri
 				raise
 			if isinstance(e, ValidationError) or 'validation error' in str(e):
 				feedback = f'\n\nYour previous output was invalid - fix this and follow the schema exactly:\n{str(e)[:600]}'
-			in_flight = 'in_flight' in str(e) or 'Retry-After' in str(e)  # OpenRouter credit-based concurrency cap: wait it out
-			await asyncio.sleep((60 if in_flight else min(30, 2**attempt)) * (0.5 + random.random()))
+			limited = any(k in str(e).lower() for k in ('rate limit', 'usage limit', 'overloaded', ' 429'))  # an account's rate limit: wait it out
+			await asyncio.sleep((60 if limited else min(30, 2**attempt)) * (0.5 + random.random()))
 
 
 def now() -> str:

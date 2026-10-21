@@ -1,6 +1,6 @@
 """The control arm: the vanilla Claude setup the claude-api skill runs in (Claude Code with WebSearch + WebFetch), on the
-same missions and tasks as the Browser Use agents. Same model, same instructions, same checks - only the browsing
-differs, so the gap between the arms is the measured edge."""
+same missions and tasks as the browser agents (agent.py on browser-harness-js). Same model, same instructions, same
+checks - only the browsing differs, so the gap between the arms is the measured edge."""
 
 import asyncio
 import json
@@ -10,17 +10,15 @@ from pathlib import Path
 
 from .browse import SEARCH_ENGINES, browser, capture, quote_in
 from .graders import grade_answer, norm
-from .llm import LEDGER, now
+from .llm import CLAUDE_BARE, LEDGER, now
 from .rollout import trace_grade
 from .runner import run_eval
 from .scout import fact_issue, slice_passage
 
-NO_TOOLS = 'Bash,Edit,Write,Read,NotebookEdit,Task,Agent,Glob,Grep'
-
 
 async def claude_web(prompt: str, model: str = 'claude-sonnet-4-6', timeout: float = 900) -> tuple[str, list[dict], float]:
 	"""One Claude Code run with only WebSearch/WebFetch. Returns (final text, trace in our format, API-equivalent $)."""
-	args = ['claude', '-p', '--model', model, '--output-format', 'stream-json', '--verbose', '--allowedTools', 'WebSearch,WebFetch', '--disallowedTools', NO_TOOLS]
+	args = ['claude', '-p', '--model', model, '--output-format', 'stream-json', '--verbose', '--tools', 'WebSearch,WebFetch', '--allowedTools', 'WebSearch,WebFetch', *CLAUDE_BARE]
 	proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd='/tmp')
 	try:
 		out, _ = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
@@ -61,11 +59,11 @@ def last_json(text: str) -> dict:
 
 async def verify_facts(facts: list[dict], kb: dict, angle: str, miner: str, materials: list[dict] = ()) -> int:
 	"""Arm-neutral evidence bar: the quote must be on the live page as a person sees it (our browser, expanded) and
-	pass the same fact rules as the Browser Use miner's record_fact. Materials are cut from that page by the same
+	pass the same fact rules as the browser miner's record_fact. Materials are cut from that page by the same
 	markers rule as record_material - we do the cutting, so this arm only has to point at the passage."""
 	session, pages, n = browser(), {}, 0
-	await session.start()
 	try:
+		await session.start()
 		for m in materials:
 			url = str(m.get('url', ''))
 			if not url.startswith('http'):
@@ -193,14 +191,14 @@ async def solve(tasks: list[dict], flow: Path, variant: str, model: str, timeout
 	return await run_eval(tasks, one, flow, variant, 1, timeout_s + 60, concurrency)
 
 
-async def compare_mining(env: Path, spec: dict, missions: list[dict], cc_model: str = 'claude-sonnet-4-6', bu_model: str = 'sonnet46') -> dict:
-	"""Same missions, same model, two harnesses. Browser Use facts are verified on the live page as they are recorded,
+async def compare_mining(env: Path, spec: dict, missions: list[dict], cc_model: str = 'claude-sonnet-4-6', agent_model: str = 'sonnet46') -> dict:
+	"""Same missions, same model, two harnesses. Browser-agent facts are verified on the live page as they are recorded,
 	Claude Code facts afterwards (on the expanded page - the more lenient check). Then: what would plain HTTP have seen."""
 	from .pipeline import look
 	from .scout import Mission, run_mission
 
 	out = {}
-	for arm in ('claude_code', 'browser_use'):
+	for arm in ('claude_code', 'browser_agent'):
 		d = env / 'compare' / arm
 		d.mkdir(parents=True, exist_ok=True)
 		usd0, t0 = LEDGER.usd, time.monotonic()
@@ -217,7 +215,7 @@ async def compare_mining(env: Path, spec: dict, missions: list[dict], cc_model: 
 								Mission(**{k: m[k] for k in ('angle', 'instructions', 'start_url')}),
 								spec['topic'],
 								kb,
-								bu_model,
+								agent_model,
 								spec.get('max_steps', 40),
 								True,
 								skill=spec.get('skill'),

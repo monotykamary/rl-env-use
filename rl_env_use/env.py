@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .graders import grade_answer
-from .rollout import POLICY_SUFFIX, Answer, public, solve_case
+from .rollout import public, solve_case
 from .tasks import balanced, keep, load_tasks
 
 
@@ -45,28 +45,11 @@ class Env:
 		if 'context' in obs:
 			_, _, answer, reasoning, _, _ = await solve_case(obs, model)
 			return {'task_id': task_id, 'answer': answer, 'reward': self.reward(task_id, answer), 'reasoning': reasoning}
-		from browser_use import Agent
+		from .rollout import browse_episode
 
-		from .browse import browser
-		from .llm import make_llm
-
-		llm = make_llm(model)
-		agent_kwargs.setdefault('browser_session', browser(obs['allowed_domains']))
-		agent = Agent(
-			task=obs['prompt'] + POLICY_SUFFIX,
-			llm=llm,
-			output_model_schema=Answer,
-			use_judge=False,
-			enable_signal_handler=False,
-			initial_actions=[{'navigate': {'url': obs['start_url']}}],
-			**agent_kwargs,
-		)
-		h = await agent.run(max_steps=max_steps)
-		try:
-			answer = h.structured_output.answer if h.is_done() and h.structured_output else None
-		except ValueError:
-			answer = None
-		return {'task_id': task_id, 'answer': answer, 'reward': self.reward(task_id, answer), 'history': h}
+		h, _ = await browse_episode(obs, model, max_steps, agent_kwargs.get('extend_system'))
+		answer = h.output.answer if h.output else None
+		return {'task_id': task_id, 'answer': answer, 'reward': self.reward(task_id, answer), 'trace': h.trace}
 
 	def export_jsonl(self, path) -> int:
 		"""Flat dataset for external RL trainers: prompt + context (or start_url) + verifiable answer spec."""
@@ -91,21 +74,3 @@ class Env:
 		rows = [{k: t[k] for k in keys if k in t} for t in self.tasks()]
 		Path(path).write_text(''.join(json.dumps(r) + '\n' for r in rows))
 		return len(rows)
-
-	def export_browser_use_yaml(self, out_dir) -> int:
-		"""browser-use's own CI task format (tests/agent_tasks/*.yaml). JSON scalars are valid YAML."""
-		out = Path(out_dir)
-		out.mkdir(parents=True, exist_ok=True)
-		browse = [t for t in self.tasks() if not t.get('context')]
-		for t in browse:
-			crit = [
-				f'The final answer must be {t["answer"]!s}' + (f' (accept: {", ".join(t["aliases"])})' if t.get('aliases') else ''),
-				'The answer must come from browsing, not guessing.',
-			]
-			body = (
-				f'name: {json.dumps(t["id"])}\ntask: {json.dumps(t["prompt"] + " Start at " + t["start_url"])}\njudge_context:\n'
-				+ ''.join(f'  - {json.dumps(c)}\n' for c in crit)
-				+ 'max_steps: 25\n'
-			)
-			(out / f'{t["id"]}.yaml').write_text(body)
-		return len(browse)

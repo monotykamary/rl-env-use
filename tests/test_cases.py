@@ -2,9 +2,8 @@
 
 import asyncio
 import json
-from types import SimpleNamespace as NS
 
-from conftest import jl, mk_task
+from conftest import FakeBrowser, jl, mk_task, tool_runner
 
 import rl_env_use.checks as C
 import rl_env_use.rollout as R
@@ -47,17 +46,7 @@ def test_slice_passage_is_verbatim_and_bounded():
 
 def test_record_material_and_outcome_fact_share_a_case(monkeypatch):
 	kb = {'facts': [], 'ideas': [], 'sources': []}
-	tools = S.make_tools(kb, 'cases')
-
-	async def page_text(_):
-		return PAGE
-
-	async def url():
-		return 'https://www.sec.gov/Archives/acme-10q.htm'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
-	sess = NS(get_current_page_url=url, cdp_client=None)
-	run = lambda name, **kw: asyncio.run(tools.registry.execute_action(name, kw, browser_session=sess))  # noqa: E731
+	run = tool_runner(S.make_tools(kb, 'cases', FakeBrowser(PAGE, 'https://www.sec.gov/Archives/acme-10q.htm')))
 	assert run('record_material', case='acme-2024', title='Acme 10-Q liquidity', starts_with='ITEM 9', ends_with='capital.').error
 	assert not run('record_material', case='acme-2024', title='Acme 10-Q liquidity', starts_with='ITEM 2. LIQUIDITY', ends_with='raise additional capital.').error
 	assert not run('record_fact', claim='cash', value='$4.1 million', quote='Cash fell to $4.1 million while', case='acme-2024').error
@@ -245,24 +234,10 @@ def test_forecasts_get_a_band_derivations_stay_exact():
 
 def test_materials_capped_until_the_outcome_is_recorded(monkeypatch):
 	kb = {'facts': [], 'ideas': [], 'sources': [], 'materials': [{'id': f'm{i}', 'case': 'acme', 'title': 't', 'text': f'other {i}', 'url': 'u'} for i in range(3)]}
-	tools = S.make_tools(kb, 'outcome')
-
-	async def page_text(_):
-		return PAGE
-
-	async def url():
-		return 'https://www.sec.gov/a.htm'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
-	sess = NS(get_current_page_url=url, cdp_client=None)
-	run = lambda name, **kw: asyncio.run(tools.registry.execute_action(name, kw, browser_session=sess))  # noqa: E731
-	other = S.make_tools(kb, 'cases')  # a new-case mission may not reuse another case's key
-	assert (
-		'already taken'
-		in asyncio.run(
-			other.registry.execute_action('record_material', dict(case='acme', title='x', starts_with='ITEM 2. LIQUIDITY', ends_with='capital.'), browser_session=sess)
-		).error
-	)
+	b = FakeBrowser(PAGE, 'https://www.sec.gov/a.htm')
+	run = tool_runner(S.make_tools(kb, 'outcome', b))
+	other = tool_runner(S.make_tools(kb, 'cases', b))  # a new-case mission may not reuse another case's key
+	assert 'already taken' in other('record_material', case='acme', title='x', starts_with='ITEM 2. LIQUIDITY', ends_with='capital.').error
 	assert 'record its outcome' in run('record_material', case='acme', title='x', starts_with='ITEM 2. LIQUIDITY', ends_with='capital.').error
 	assert not run('record_fact', claim='cash', value='$4.1 million', quote='Cash fell to $4.1 million while', case='acme').error
 	assert not run('record_material', case='acme', title='x', starts_with='ITEM 2. LIQUIDITY', ends_with='capital.').error
@@ -270,37 +245,18 @@ def test_materials_capped_until_the_outcome_is_recorded(monkeypatch):
 
 def test_record_fact_without_value_takes_the_single_number(monkeypatch):
 	kb = {'facts': [], 'ideas': [], 'sources': []}
-	tools = S.make_tools(kb, 'cases')
-
-	async def page_text(_):
-		return 'Overall Study Started 28 participants; Completed 26 participants. Mean change in body weight Tirzepatide -20.9 % and placebo -3.1 %'
-
-	async def url():
-		return 'https://clinicaltrials.gov/study/NCT1?tab=results'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
-	sess = NS(get_current_page_url=url, cdp_client=None)
-	run = lambda **kw: asyncio.run(tools.registry.execute_action('record_fact', kw, browser_session=sess))  # noqa: E731
-	assert not run(claim='completed', quote='Completed 26 participants. Mean change', case='nct1').error
-	assert 'Give `value`' in run(claim='weight change', quote='Tirzepatide -20.9 % and placebo -3.1 %', case='nct1').error
+	page = 'Overall Study Started 28 participants; Completed 26 participants. Mean change in body weight Tirzepatide -20.9 % and placebo -3.1 %'
+	run = tool_runner(S.make_tools(kb, 'cases', FakeBrowser(page, 'https://clinicaltrials.gov/study/NCT1?tab=results')))
+	assert not run('record_fact', claim='completed', quote='Completed 26 participants. Mean change', case='nct1').error
+	assert 'Give `value`' in run('record_fact', claim='weight change', quote='Tirzepatide -20.9 % and placebo -3.1 %', case='nct1').error
 	assert kb['facts'][0]['value'] == '26'
 
 
 def test_outcome_must_use_a_known_case_key(monkeypatch):
 	kb = {'facts': [], 'ideas': [], 'sources': [], 'materials': [{'id': 'm0', 'case': 'NCT1_protocol', 'title': 't', 'text': 'x', 'url': 'u'}]}
-	tools = S.make_tools(kb, 'cases')
-
-	async def page_text(_):
-		return 'Enrollment (Actual) 28 participants'
-
-	async def url():
-		return 'https://clinicaltrials.gov/study/NCT1'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
-	sess = NS(get_current_page_url=url, cdp_client=None)
-	run = lambda **kw: asyncio.run(tools.registry.execute_action('record_fact', kw, browser_session=sess))  # noqa: E731
-	assert 'NCT1_protocol' in run(claim='enrollment', quote='Enrollment (Actual) 28', value='28', case='NCT1_results').error
-	assert not run(claim='enrollment', quote='Enrollment (Actual) 28', value='28', case='NCT1_protocol').error
+	run = tool_runner(S.make_tools(kb, 'cases', FakeBrowser('Enrollment (Actual) 28 participants', 'https://clinicaltrials.gov/study/NCT1')))
+	assert 'NCT1_protocol' in run('record_fact', claim='enrollment', quote='Enrollment (Actual) 28', value='28', case='NCT1_results').error
+	assert not run('record_fact', claim='enrollment', quote='Enrollment (Actual) 28', value='28', case='NCT1_protocol').error
 	kb['facts'].append({'id': 'f1', 'case': 'no-materials', 'claim': 'c', 'value': '1', 'quote': 'q', 'url': 'https://x.org/y'})
 	[m] = S.enrich_missions(kb)  # complete cases only, starting from where the outcome was found
 	assert m.angle == 'enrich' and m.start_url == 'https://clinicaltrials.gov/study/NCT1' and 'case="NCT1_protocol"' in m.instructions
@@ -334,17 +290,8 @@ def test_fact_sign_must_match_the_page():
 
 def test_record_outcome_saves_a_verbatim_results_passage(monkeypatch):
 	kb = {'facts': [], 'ideas': [], 'sources': [], 'materials': [{'id': 'm0', 'case': 'acme', 'title': 't', 'text': 'x', 'url': 'u'}]}
-	tools = S.make_tools(kb, 'cases')
-
-	async def page_text(_):
-		return PAGE
-
-	async def url():
-		return 'https://www.sec.gov/a.htm'
-
-	monkeypatch.setattr(S, 'page_text', page_text)
-	sess = NS(get_current_page_url=url, cdp_client=None)
-	run = lambda **kw: asyncio.run(tools.registry.execute_action('record_outcome', kw, browser_session=sess))  # noqa: E731
+	tools = tool_runner(S.make_tools(kb, 'cases', FakeBrowser(PAGE, 'https://www.sec.gov/a.htm')))
+	run = lambda **kw: tools('record_outcome', **kw)  # noqa: E731
 	assert 'Unknown case' in run(case='beta', title='r', starts_with='ITEM 2. LIQUIDITY', ends_with='capital.').error
 	assert not run(case='acme', title='results', starts_with='ITEM 2. LIQUIDITY', ends_with='capital.').error
 	f = kb['facts'][0]

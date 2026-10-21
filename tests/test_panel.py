@@ -426,8 +426,8 @@ def test_panel_stage_default_models_and_cap(tmp_path, monkeypatch):
 	out = asyncio.run(P.panel_stage(env, {}))
 	v = [t['checks']['panel']['verdict'] for t in jl(env / 'tasks.jsonl')]
 	assert v == ['capped'] * 5 and '5 all-fail tasks over the cap' in out  # no non-all-fail task kept: none allowed
-	assert V.PANEL == ['opus55', 'gpt-astra', 'gemini'] and {c['model'] for c in log} - {'gpt-astra'} == {'opus55', 'gemini'}
-	assert len(adj_calls(log)) == 5 and {c['model'] for c in adj_calls(log)} == {'gpt-astra'}  # the first default adjudicator; all three gave the modal answer
+	assert V.PANEL == ['opus55', 'gpt-astra'] and {c['model'] for c in log} - {'gpt-astra'} == {'opus55'}
+	assert len(adj_calls(log)) == 5 and {c['model'] for c in adj_calls(log)} == {'gpt-astra'}  # the first default adjudicator; both gave the modal answer
 	assert all(
 		('Think it through' in c['user']) == (c['model'] in ('opus55', 'gpt-astra')) for c in log if not c['system'].startswith('You adjudicate')
 	)  # closed frontier models answer only
@@ -459,7 +459,7 @@ def test_adjudicator_falls_back_to_first_when_all_gave_it(monkeypatch):
 def test_adjudicators_param(monkeypatch):
 	t = ct()
 	log = run(monkeypatch, [t], {m: '1000' for m in MODELS} | {'judge': '1000'}, CONFIRM, adjudicators=['haiku', 'judge'])
-	assert [c['model'] for c in adj_calls(log)] == ['judge'] and V.ADJUDICATORS == ['gpt-astra', 'opus55', 'gemini']
+	assert [c['model'] for c in adj_calls(log)] == ['judge'] and V.ADJUDICATORS == ['gpt-astra', 'opus55']
 
 
 def test_answers_stating_several_values_mark_a_multi_value_prompt(monkeypatch):
@@ -473,7 +473,7 @@ def test_answers_stating_several_values_mark_a_multi_value_prompt(monkeypatch):
 
 def test_a_new_panel_re_measures_tasks_measured_by_another():
 	old = ct(0, checks=OK | {'panel': {'verdict': 'keep', 'scores': {'haiku': 0.0}}})  # legacy: no models recorded
-	same = ct(1, checks=OK | {'panel': {'verdict': 'saturated', 'models': ['opus55', 'gpt-astra', 'gemini']}})
+	same = ct(1, checks=OK | {'panel': {'verdict': 'saturated', 'models': ['opus55', 'gpt-astra']}})
 	assert P.panel_todo(old, V.PANEL) and not P.panel_todo(same, V.PANEL) and not P.panel_todo(old)
 
 

@@ -1,24 +1,21 @@
 """Stage 3: run the policy over tasks and write results in the claude-api hillclimb contract. Case tasks: the model
-reads the materials and answers (one structured call, no tools). Browse tasks: a browser agent on the live web.
+reads the materials and answers (one structured call, no tools). Browse tasks: a browser agent on the live web (agent.py).
 
 <flow>/<variant>/results.jsonl     one row per (case, rep), appended as each completes (resume-safe)
 <flow>/<variant>/traces/<id>_rep<k>.json
 <flow>/<variant>/errors.jsonl      infra failures (timeouts, crashes) - never scored as model failures
 """
 
-import asyncio
-import json
-import shutil
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from browser_use import Agent
 from pydantic import BaseModel, Field
 
+from .agent import run_agent
 from .browse import browser
 from .graders import grade_answer, grounded, max_repeats
-from .llm import LEDGER, add_usage, call, cost, make_llm, now, usage_dict
+from .llm import add_usage, call, cost, now
 from .runner import run_eval
 
 LOOP = 5  # identical tool calls at which a trajectory counts as looping
@@ -101,68 +98,46 @@ async def run_case_task(t: dict, rep: int, model: str, judges=None, extend_syste
 	}
 
 
-def history_to_trace(h, system: str) -> list[dict]:
-	"""Text trace of an episode (no screenshots kept: they cost ~1 MB per episode and the text says what happened)."""
-	turns = [{'role': 'system', 'content': system}]
-	for i, step in enumerate(h.history):
-		mo = step.model_output
-		if mo:
-			text = '\n'.join(f'{k}: {v}' for k, v in [('eval', mo.evaluation_previous_goal), ('memory', mo.memory), ('next_goal', mo.next_goal)] if v)
-			turns.append({'role': 'assistant', 'content': f'[step {i} @ {step.state.url}]\n{text}', 'thinking': mo.thinking or None})
-			for a in mo.action:
-				for name, params in a.model_dump(exclude_none=True).items():
-					turns.append({'role': 'tool_call', 'name': name, 'content': json.dumps(params, indent=1, default=str)})
-		for r in step.result:
-			turns.append({'role': 'tool_result', 'content': r.error or r.extracted_content or ('done' if r.is_done else '')})
-	return turns
-
-
-async def run_case(t: dict, rep: int, model: str, vdir: Path, max_steps: int, headless: bool, judges=None, extend_system: str | None = None) -> tuple[list, dict]:
-	pub = public(t)
-	llm = make_llm(model)
+async def browse_episode(pub: dict, model: str, max_steps: int, extend_system: str | None = None):
+	"""One browse-task episode on a fresh browser, always stopped afterwards: (run, the task text the agent got)."""
 	task = pub['prompt'] + POLICY_SUFFIX
-	agent = Agent(
-		task=task,
-		llm=llm,
-		browser_session=browser(pub['allowed_domains'], headless),
-		output_model_schema=Answer,
-		use_judge=False,
-		enable_signal_handler=False,
-		calculate_cost=True,
-		extend_system_message=extend_system,
-		initial_actions=[{'navigate': {'url': pub['start_url']}}],
-	)
+	b = browser(pub.get('allowed_domains'))
+	try:
+		await b.start()
+		h = await run_agent(
+			model,
+			task,
+			b,
+			Answer,
+			max_steps=max_steps,
+			system=extend_system,
+			start_url=pub['start_url'],
+			done_description='Give your final answer. Call exactly once, as the last action.',
+		)
+	finally:  # a cancelled episode (wall-clock ceiling) must still stop its browser
+		await b.kill()
+	return h, task
+
+
+async def run_case(t: dict, rep: int, model: str, vdir: Path, max_steps: int, headless: bool = True, judges=None, extend_system: str | None = None) -> tuple[list, dict]:
 	t0 = time.monotonic()
-	try:
-		h = await agent.run(max_steps=max_steps)
-	finally:  # a cancelled episode (wall-clock ceiling) must still release its cloud browser
-		try:
-			await asyncio.wait_for(agent.close(), 30)
-		except (Exception, asyncio.CancelledError):
-			pass
+	h, task = await browse_episode(public(t), model, max_steps, extend_system)
 	latency = time.monotonic() - t0
-	errs = [e for e in h.errors() if e]
-	if not h.is_done() and h.number_of_steps() < max_steps and errs and h.errors()[-1]:  # browser-use stops after repeated LLM errors without raising: infra, not a miss
-		shutil.rmtree(agent.agent_directory, ignore_errors=True)
-		raise RuntimeError(f'agent stopped on errors: {errs[-1][:300]}')
-	try:
-		out = h.structured_output if h.is_done() else None
-	except ValueError:  # done with free text instead of the schema: no scorable answer
-		out = None
+	if not h.done and h.steps < max_steps and h.errors:  # stopped on tool crashes before its budget: infra, not a miss
+		raise RuntimeError(f'agent stopped on errors: {h.errors[-1][:300]}')
+	out = h.output
 	answer = out.answer if out else None
 	correct = grade_answer(t, answer)
-	trace = history_to_trace(h, task)
-	shutil.rmtree(agent.agent_directory, ignore_errors=True)  # browser-use's per-agent temp dir (~10 MB of screenshots)
+	trace = h.trace
 	trace.append({'role': 'assistant', 'content': f'FINAL ANSWER: {answer}' + (f'\nsource: {out.source_url}' if out and out.source_url else '')})
-	usage = usage_dict(h.usage)
-	LEDGER.add(llm.model, usage)
+	usage = h.usage
 	grade, expl, judge_usage, judge_model = trace_grade(t, correct, trace), {}, {}, None
 	for j in judges or []:
 		v = await j.run(t, trace, answer)
 		grade[j.id], expl[j.id], judge_model = v['score'], v['reasoning'], v['model']
 		judge_usage = add_usage(judge_usage, v['usage'])
-	fc = None if correct else ('no_answer' if answer is None else ('gave_up' if h.is_successful() is False else 'wrong_answer'))
-	domains = list(dict.fromkeys(urlparse(u).netloc for u in h.urls() if u))
+	fc = None if correct else ('no_answer' if answer is None else 'wrong_answer')
+	domains = list(dict.fromkeys(urlparse(u).netloc for u in h.urls if u))
 	return trace, {
 		'prompt_id': t['id'],
 		'rep': rep,
@@ -171,21 +146,21 @@ async def run_case(t: dict, rep: int, model: str, vdir: Path, max_steps: int, he
 		'grade': grade,
 		**({'explanation': expl} if expl else {}),
 		'status': 'ok',
-		'stop_reason': 'done' if h.is_done() else 'max_steps',
-		'model': llm.model,
+		'stop_reason': h.stop_reason,
+		'model': h.model,
 		'latency_s': round(latency, 2),
-		'tool_calls': sum(len(s.model_output.action) for s in h.history if s.model_output),
-		'steps': h.number_of_steps(),
+		'tool_calls': h.steps,
+		'steps': h.steps,
 		'usage': usage,
-		'cost_usd': round(cost(llm.model, usage) or 0, 5),
+		'cost_usd': round(cost(h.model, usage) or 0, 5),
 		**({'judge_model': judge_model, 'judge_usage': judge_usage} if judge_usage else {}),
 		'meta': {
 			'answer': answer,
 			'gold': t['answer'],
 			'failure_class': fc,
-			'agent_claimed_success': h.is_successful(),
+			'agent_claimed_success': h.done,
 			'domains': domains,
-			'errors': [e for e in h.errors() if e][:5],
+			'errors': h.errors[:5],
 			'at': now(),
 		},
 	}
@@ -195,7 +170,7 @@ async def rollout(
 	tasks: list[dict],
 	flow: Path,
 	variant: str = 'baseline',
-	model: str = 'bu',
+	model: str = 'sonnet46',
 	reps: int = 1,
 	max_steps: int = 25,
 	timeout_s: float = 600,

@@ -44,10 +44,10 @@ async def run_eval(cases: list[dict], run_one, flow: Path, variant: str = 'basel
 				try:
 					trace, row = await asyncio.wait_for(run_one(c, rep, vdir), timeout_s)
 					break
-				except (Exception, asyncio.CancelledError) as e:  # browser-use internal timeouts raise CancelledError
+				except (Exception, asyncio.CancelledError) as e:  # a cancelled inner wait surfaces as CancelledError
 					if isinstance(e, asyncio.CancelledError) and asyncio.current_task().cancelling():
 						raise  # a real outer cancellation (Ctrl-C) must propagate
-					if not (('Too many concurrent' in str(e) or 'HTTP 429' in str(e)) and attempt < 2):  # full browser pool: never started, retry
+					if not (('Too many concurrent' in str(e) or 'HTTP 429' in str(e)) and attempt < 2):  # rate-limited before it started: retry
 						cls = 'timeout' if isinstance(e, asyncio.TimeoutError) else 'refusal' if REFUSAL.search(str(e)) else 'harness_error'
 						async with lock:
 							with err.open('a') as f:
